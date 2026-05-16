@@ -55,7 +55,8 @@ async def db_init() -> None:
             created_at INTEGER NOT NULL,
             payout_role_id INTEGER,
             payout_role_name TEXT,
-            hosted_by TEXT
+            hosted_by TEXT,
+            start_ts INTEGER
         );
         """)
 
@@ -135,6 +136,7 @@ async def db_init() -> None:
             "ALTER TABLE contents ADD COLUMN payout_role_id INTEGER",
             "ALTER TABLE contents ADD COLUMN payout_role_name TEXT",
             "ALTER TABLE contents ADD COLUMN hosted_by TEXT",
+            "ALTER TABLE contents ADD COLUMN start_ts INTEGER",
         ]
         for sql in migrations_contents:
             try:
@@ -154,14 +156,15 @@ async def db_create_content(
     ends_at: int,
     created_by: int,
     hosted_by: Optional[str] = None,
+    start_ts: Optional[int] = None,
 ) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
-            INSERT INTO contents (guild_id, channel_id, title, roles_text, after_text, ends_at, status, created_by, created_at, hosted_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO contents (guild_id, channel_id, title, roles_text, after_text, ends_at, status, created_by, created_at, hosted_by, start_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (guild_id, channel_id, title, roles_text, after_text, ends_at, STATUS_OPEN, created_by, int(time.time()), hosted_by)
+            (guild_id, channel_id, title, roles_text, after_text, ends_at, STATUS_OPEN, created_by, int(time.time()), hosted_by, start_ts)
         )
         await db.commit()
         return cur.lastrowid
@@ -484,6 +487,31 @@ def ts_discord(unix_ts: int, fmt: str = "F") -> str:
     return f"<t:{unix_ts}:{fmt}>"
 
 
+import datetime
+
+def parse_utc_time(time_str: str) -> Optional[int]:
+    """
+    Парсит строку "ЧЧ:ММ" как время в UTC сегодня и возвращает unix timestamp.
+    Если время уже прошло — берёт следующий день.
+    """
+    try:
+        parts = time_str.strip().split(":")
+        if len(parts) != 2:
+            return None
+        hh, mm = int(parts[0]), int(parts[1])
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return None
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        target = now_utc.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if target <= now_utc:
+            target += datetime.timedelta(days=1)
+        return int(target.timestamp())
+    except Exception:
+        return None
+
+
+
+
 def normalize_roles_lines(raw: str) -> List[str]:
     lines = [ln.strip() for ln in raw.splitlines()]
     return [ln for ln in lines if ln]
@@ -513,10 +541,7 @@ def parse_user_ids_from_text(text: str) -> List[int]:
     return out
 
 
-def _ends_at_line(ends_at: int) -> str:
-    if ends_at and ends_at > 0:
-        return f"Запись до: {ts_discord(ends_at, 'F')} ({ts_discord(ends_at, 'R')})"
-    return "Запись до: _без таймера (закрытие вручную)_"
+# _ends_at_line удалена (таймер дедлайна убран)
 
 
 def _deadline_expired(ends_at: int) -> bool:
@@ -535,6 +560,7 @@ def build_main_post_embed(
     attendance_only: List[int],
     after_text: Optional[str],
     hosted_by: Optional[str] = None,
+    start_ts: Optional[int] = None,
 ) -> discord.Embed:
     by_index = {idx: uid for idx, uid in roster}
     participants_count = len({uid for _, uid in roster}) + len(attendance_only)
@@ -547,35 +573,41 @@ def build_main_post_embed(
         color=color
     )
 
+    # Be ready by — время старта
+    if start_ts and start_ts > 0:
+        import datetime as _dt
+        utc_dt = _dt.datetime.fromtimestamp(start_ts, tz=_dt.timezone.utc)
+        utc_str = utc_dt.strftime("%H:%M UTC")
+        # <t:...:F> = локальная дата/время зрителя, <t:...:R> = через сколько
+        ready_val = f"{utc_str} • {ts_discord(start_ts, 'F')} • {ts_discord(start_ts, 'R')}"
+        embed.add_field(name="⏰ Be ready by", value=ready_val, inline=False)
+
+    # Организатор
+    if hosted_by:
+        embed.add_field(name="👤 Content hosted by", value=hosted_by, inline=False)
+
     # Статус
-    status_str = "🟢 Открыт" if status == STATUS_OPEN else "🔴 Закрыт"
+    status_str = "🟢 Open" if status == STATUS_OPEN else "🔴 Closed"
     if expired and status == STATUS_OPEN:
-        status_str = "🟡 Таймер истёк"
-    embed.add_field(name="Статус", value=status_str, inline=True)
-    embed.add_field(name="Участники", value=f"**{participants_count}**", inline=True)
+        status_str = "🟡 Timer expired"
+    embed.add_field(name="Status", value=status_str, inline=True)
+    embed.add_field(name="Players", value=f"**{participants_count}**", inline=True)
     embed.add_field(name="ID", value=f"`{message_id}`", inline=True)
 
-    # Таймер
-    if ends_at and ends_at > 0:
-        timer_val = f"{ts_discord(ends_at, 'F')}\n{ts_discord(ends_at, 'R')}"
-        if expired:
-            timer_val += "\n⚠️ Таймер истёк"
-    else:
-        timer_val = "_без таймера_"
-    embed.add_field(name="⏰ Запись до", value=timer_val, inline=False)
+    # Таймер дедлайна убран
 
     # Ветка
     if thread_id:
-        embed.add_field(name="💬 Ветка", value=f"<#{thread_id}>", inline=True)
+        embed.add_field(name="💬 Thread", value=f"<#{thread_id}>", inline=True)
 
-    # Роли
+    # Роли — все слоты, занятые с тегом, свободные просто с тире
     roles_lines_fmt = []
     for i, role_name in enumerate(roles_lines, start=1):
         uid = by_index.get(i)
         if uid:
             roles_lines_fmt.append(f"`{i}.` {role_name} — <@{uid}>")
         else:
-            roles_lines_fmt.append(f"`{i}.` {role_name} — *свободно*")
+            roles_lines_fmt.append(f"`{i}.` {role_name} —")
 
     # Разбиваем на чанки если ролей много (лимит поля embed 1024 символа)
     chunk = []
@@ -584,7 +616,7 @@ def build_main_post_embed(
     for line in roles_lines_fmt:
         if chunk_size + len(line) + 1 > 950 and chunk:
             embed.add_field(
-                name="📝 Роли" if field_num == 0 else "\u200b",
+                name="📝 Roles" if field_num == 0 else "\u200b",
                 value="\n".join(chunk),
                 inline=False
             )
@@ -596,7 +628,7 @@ def build_main_post_embed(
 
     if chunk:
         embed.add_field(
-            name="📝 Роли" if field_num == 0 else "\u200b",
+            name="📝 Roles" if field_num == 0 else "\u200b",
             value="\n".join(chunk),
             inline=False
         )
@@ -605,11 +637,11 @@ def build_main_post_embed(
     if attendance_only:
         start = len(roles_lines) + 1
         att_lines = [f"`{j}.` <@{uid}>" for j, uid in enumerate(attendance_only, start=start)]
-        embed.add_field(name="➕ Дополнительно", value="\n".join(att_lines[:20]), inline=False)
+        embed.add_field(name="➕ Additionally", value="\n".join(att_lines[:20]), inline=False)
 
     # Примечание
     if after_text and after_text.strip():
-        embed.add_field(name="📌 Примечание", value=after_text.strip(), inline=False)
+        embed.add_field(name="📌 Note", value=after_text.strip(), inline=False)
 
     # Инструкция
     embed.add_field(
@@ -617,10 +649,6 @@ def build_main_post_embed(
         value="➣ `1` — занять роль (если свободна)\n➣ `-` — выписаться с роли",
         inline=False
     )
-
-    # Hosted by
-    if hosted_by:
-        embed.set_footer(text=f"Организатор: {hosted_by}")
 
     return embed
 
@@ -651,6 +679,7 @@ async def refresh_main_post(guild: discord.Guild, content_row) -> None:
             attendance_only=attendance_only,
             after_text=str(content_row["after_text"]) if content_row["after_text"] else None,
             hosted_by=str(content_row["hosted_by"]) if content_row["hosted_by"] else None,
+            start_ts=int(content_row["start_ts"]) if content_row["start_ts"] else None,
         )
 
         await msg.edit(content=None, embed=embed)
@@ -856,6 +885,12 @@ class ContentCreateModal(discord.ui.Modal, title="Создать контент"
         style=discord.TextStyle.paragraph,
         max_length=1500
     )
+    start_time_input = discord.ui.TextInput(
+        label="Время старта в UTC (ЧЧ:ММ)",
+        placeholder="Например: 18:35",
+        required=True,
+        max_length=5
+    )
     after_text = discord.ui.TextInput(
         label="Примечание (опционально)",
         placeholder="Например: /join NickName",
@@ -867,12 +902,6 @@ class ContentCreateModal(discord.ui.Modal, title="Создать контент"
         placeholder="Если пусто — будет как заголовок",
         required=False,
         max_length=100
-    )
-    hosted_by_input = discord.ui.TextInput(
-        label="Организатор (Content hosted by)",
-        placeholder="Ваш игровой никнейм",
-        required=False,
-        max_length=80
     )
 
     def __init__(self, duration_minutes: int, create_thread: bool, auto_assign_organizer: bool = True):
@@ -894,14 +923,21 @@ class ContentCreateModal(discord.ui.Modal, title="Создать контент"
             await interaction.followup.send("Команду нужно запускать в текстовом канале.", ephemeral=True)
             return
 
-        if self.duration_minutes and self.duration_minutes > 0:
-            ends_at = int(time.time()) + self.duration_minutes * 60
-        else:
-            ends_at = 0
+        # Парсим время старта в UTC
+        start_ts = parse_utc_time(str(self.start_time_input).strip())
+        if start_ts is None:
+            await interaction.followup.send(
+                "❌ Неверный формат времени. Используй ЧЧ:ММ, например `18:35`.",
+                ephemeral=True
+            )
+            return
+
+        ends_at = 0  # таймер дедлайна убран
 
         title = str(self.title_text).strip()
         after = str(self.after_text).strip() if str(self.after_text).strip() else None
-        hosted_by = str(self.hosted_by_input).strip() if str(self.hosted_by_input).strip() else None
+        # Организатор = автоматически тег создателя
+        hosted_by = f"<@{interaction.user.id}>"
 
         content_id = await db_create_content(
             guild_id=interaction.guild_id,
@@ -912,6 +948,7 @@ class ContentCreateModal(discord.ui.Modal, title="Создать контент"
             ends_at=ends_at,
             created_by=interaction.user.id,
             hosted_by=hosted_by,
+            start_ts=start_ts,
         )
 
         # Временная заглушка
