@@ -194,6 +194,25 @@ async def db_init() -> None:
     await DB.execute("CREATE INDEX IF NOT EXISTS idx_contents_guild_type_start ON contents(guild_id, content_type, start_ts)")
     await DB.execute("CREATE INDEX IF NOT EXISTS idx_awards_guild_user ON attendance_awards(guild_id, user_id)")
     await DB.execute("CREATE INDEX IF NOT EXISTS idx_balevents_guild_user ON balance_events(guild_id, user_id)")
+    await DB.execute("CREATE INDEX IF NOT EXISTS idx_awards_guild_awarded ON attendance_awards(guild_id, awarded_at)")
+
+    # Самолечение: joined_at должен = времени первого начисления.
+    # Чинит данные, записанные старым кодом (где joined_at ошибочно = start_ts в будущем).
+    await DB.execute("""
+        UPDATE attendance_join
+        SET joined_at = (
+            SELECT MIN(a.awarded_at) FROM attendance_awards a
+            WHERE a.guild_id = attendance_join.guild_id AND a.user_id = attendance_join.user_id
+        )
+        WHERE EXISTS (
+            SELECT 1 FROM attendance_awards a
+            WHERE a.guild_id = attendance_join.guild_id AND a.user_id = attendance_join.user_id
+        )
+        AND joined_at <> (
+            SELECT MIN(a.awarded_at) FROM attendance_awards a
+            WHERE a.guild_id = attendance_join.guild_id AND a.user_id = attendance_join.user_id
+        )
+    """)
     await DB.commit()
 
 
@@ -378,16 +397,15 @@ async def db_get_all_participants(content_id: int) -> List[int]:
 # =========================
 async def db_att_award_for_content(
     guild_id: int, content_id: int, user_ids: List[int],
-    awarded_by: int, content_start_ts: Optional[int],
+    awarded_by: int, content_start_ts: Optional[int] = None,
 ) -> Tuple[int, int]:
     now = int(time.time())
-    join_ts = int(content_start_ts) if content_start_ts else now
     awarded = already = 0
     for uid in user_ids:
-        # joined_at = start_ts первого зачтённого контента, неизменна
+        # joined_at = время первого НАЧИСЛЕНИЯ ("начал аттендить"), неизменно
         await DB.execute(
             "INSERT OR IGNORE INTO attendance_join (guild_id, user_id, joined_at) VALUES (?, ?, ?)",
-            (guild_id, uid, join_ts)
+            (guild_id, uid, now)
         )
         try:
             await DB.execute(
@@ -433,9 +451,9 @@ async def db_get_joined_at(guild_id: int, user_id: int) -> Optional[int]:
 
 
 def window_bounds(scope: str) -> Tuple[int, int]:
-    """Возвращает (lo, hi) unix-границы окна по start_ts контента."""
+    """(lo, hi) unix-границы окна по awarded_at. Полуинтервал [lo, hi)."""
     now = datetime.datetime.now(datetime.timezone.utc)
-    hi = int(now.timestamp())
+    hi = int(now.timestamp()) + 1  # +1 чтобы включить только что начисленное (awarded_at == now)
     if scope == "week":
         lo = int((now - datetime.timedelta(days=7)).timestamp())
     elif scope == "month":  # текущий календарный месяц
@@ -453,25 +471,34 @@ def window_bounds(scope: str) -> Tuple[int, int]:
 
 
 async def db_att_profile(guild_id: int, user_id: int, scope: str) -> Optional[dict]:
-    """% посещаемости по обяз/необяз контенту в окне scope. None если юзер ни разу не аттендил."""
+    """
+    % посещаемости по обяз/необяз в окне scope.
+    Окно считается по awarded_at (когда начислен аттенданс), а не по запланированному start_ts.
+    Знаменатель = контенты этого типа, по которым в окне был начислен аттенданс кому-либо
+    (т.е. реально проведённые); числитель — те из них, что посетил юзер.
+    None, если юзер ни разу не аттендил.
+    """
     joined = await db_get_joined_at(guild_id, user_id)
     if joined is None:
         return None
     lo, hi = window_bounds(scope)
-    floor = max(joined, lo)  # контент, которого не было когда юзер вступил, в знаменатель не идёт
+    floor = max(joined, lo)  # контент до того, как юзер начал аттендить, не учитываем
 
     res = {"joined_at": joined, "scope": scope}
     for ctype in (TYPE_MANDATORY, TYPE_OPTIONAL):
         cur = await DB.execute(
-            "SELECT COUNT(*) FROM contents WHERE guild_id = ? AND content_type = ? AND start_ts >= ? AND start_ts < ?",
+            """SELECT COUNT(DISTINCT a.content_id)
+               FROM attendance_awards a JOIN contents c ON c.id = a.content_id
+               WHERE a.guild_id = ? AND c.content_type = ?
+                 AND a.awarded_at >= ? AND a.awarded_at < ?""",
             (guild_id, ctype, floor, hi)
         )
         total = int((await cur.fetchone())[0])
         cur = await DB.execute(
-            """SELECT COUNT(*) FROM attendance_awards a
-               JOIN contents c ON c.id = a.content_id
+            """SELECT COUNT(DISTINCT a.content_id)
+               FROM attendance_awards a JOIN contents c ON c.id = a.content_id
                WHERE a.guild_id = ? AND a.user_id = ? AND c.content_type = ?
-                 AND c.start_ts >= ? AND c.start_ts < ?""",
+                 AND a.awarded_at >= ? AND a.awarded_at < ?""",
             (guild_id, user_id, ctype, floor, hi)
         )
         attended = int((await cur.fetchone())[0])
@@ -481,16 +508,15 @@ async def db_att_profile(guild_id: int, user_id: int, scope: str) -> Optional[di
 
 
 async def db_att_leaderboard_month(guild_id: int) -> List[Tuple[int, int]]:
-    """Лидерборд за текущий календарный месяц (по start_ts контента)."""
+    """Лидерборд за текущий календарный месяц (по awarded_at)."""
     lo, hi = window_bounds("month")
     cur = await DB.execute(
-        """SELECT a.user_id, COUNT(*) AS cnt
-           FROM attendance_awards a
-           JOIN contents c ON c.id = a.content_id
-           WHERE a.guild_id = ? AND c.start_ts >= ? AND c.start_ts < ?
-           GROUP BY a.user_id
+        """SELECT user_id, COUNT(*) AS cnt
+           FROM attendance_awards
+           WHERE guild_id = ? AND awarded_at >= ? AND awarded_at < ?
+           GROUP BY user_id
            HAVING cnt > 0
-           ORDER BY cnt DESC, MIN(a.awarded_at) ASC""",
+           ORDER BY cnt DESC, MIN(awarded_at) ASC""",
         (guild_id, lo, hi)
     )
     rows = await cur.fetchall()
@@ -1649,7 +1675,7 @@ async def balance(interaction: discord.Interaction, user: Optional[discord.Membe
 @bot.tree.command(name="money_add", description="Начислить деньги пользователю (стафф)")
 @app_commands.describe(user="Кому", amount="Сколько (>0)", reason="Причина (опционально)")
 async def money_add(interaction: discord.Interaction, user: discord.Member, amount: int, reason: Optional[str] = None):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     member = get_member_safe(interaction)
     if member is None or not member_is_staff(member):
         await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
@@ -1661,13 +1687,13 @@ async def money_add(interaction: discord.Interaction, user: discord.Member, amou
                           description=f"{user.mention}: +{fmt_money(amount)}\nНовый баланс: **{fmt_money(new)}**")
     if reason:
         embed.add_field(name="Причина", value=reason, inline=False)
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="money_sub", description="Снять деньги у пользователя (стафф, минимум 0)")
 @app_commands.describe(user="У кого", amount="Сколько (>0)", reason="Причина (опционально)")
 async def money_sub(interaction: discord.Interaction, user: discord.Member, amount: int, reason: Optional[str] = None):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     member = get_member_safe(interaction)
     if member is None or not member_is_staff(member):
         await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
@@ -1682,13 +1708,13 @@ async def money_sub(interaction: discord.Interaction, user: discord.Member, amou
         embed.add_field(name="⚠️", value=f"Запрошено {fmt_money(amount)}, но баланс ушёл в 0.", inline=False)
     if reason:
         embed.add_field(name="Причина", value=reason, inline=False)
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="money_payout_role", description="Начислить деньги всем с ролью (стафф)")
 @app_commands.describe(role="Роль", amount="Сколько каждому (>0)", reason="Причина (опционально)")
 async def money_payout_role(interaction: discord.Interaction, role: discord.Role, amount: int, reason: Optional[str] = None):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     member = get_member_safe(interaction)
     if member is None or not member_is_staff(member):
         await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
@@ -1704,13 +1730,13 @@ async def money_payout_role(interaction: discord.Interaction, role: discord.Role
                           description=f"Роль {role.mention}: +{fmt_money(amount)} каждому\nПолучателей: **{len(targets)}**")
     if reason:
         embed.add_field(name="Причина", value=reason, inline=False)
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="money_payout_content", description="Начислить деньги всем участникам контента (стафф)")
 @app_commands.describe(content_id="ID контента", amount="Сколько каждому (>0)", reason="Причина (опционально)")
 async def money_payout_content(interaction: discord.Interaction, content_id: int, amount: int, reason: Optional[str] = None):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=False)
     row = await db_get_content_by_id(content_id)
     if row is None:
         await interaction.followup.send("Контент не найден.", ephemeral=True); return
@@ -1729,7 +1755,7 @@ async def money_payout_content(interaction: discord.Interaction, content_id: int
                           description=f"Контент **#{content_id}**: +{fmt_money(amount)} каждому\nПолучателей: **{len(user_ids)}**")
     if reason:
         embed.add_field(name="Причина", value=reason, inline=False)
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed)
 
 
 # =========================
