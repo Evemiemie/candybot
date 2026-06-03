@@ -38,6 +38,14 @@ TYPE_OPTIONAL = "optional"
 LEADERBOARD_PAGE_SIZE = 20
 FUZZ_CUTOFF = 78  # порог совпадения ника при OCR
 
+CURRENCY = "💰"  # символ валюты — поменять тут
+
+# Роли, дающие доступ к управляющим командам (помимо admin/manage_guild/manage_roles).
+# .env: STAFF_ROLE_IDS=123,456
+STAFF_ROLE_IDS: Set[int] = {
+    int(x) for x in os.getenv("STAFF_ROLE_IDS", "").replace(" ", "").split(",") if x.isdigit()
+}
+
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 
 COLOR_BLUE   = 0x5865F2
@@ -145,6 +153,30 @@ async def db_init() -> None:
     );
     """)
 
+    await DB.execute("""
+    CREATE TABLE IF NOT EXISTS balances (
+        guild_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        amount INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, user_id)
+    );
+    """)
+
+    await DB.execute("""
+    CREATE TABLE IF NOT EXISTS balance_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        delta INTEGER NOT NULL,
+        balance_after INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        reason TEXT,
+        actor_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    """)
+
     # Миграции для старой БД (новые колонки contents).
     migrations = [
         "ALTER TABLE contents ADD COLUMN content_type TEXT NOT NULL DEFAULT 'mandatory'",
@@ -161,6 +193,7 @@ async def db_init() -> None:
 
     await DB.execute("CREATE INDEX IF NOT EXISTS idx_contents_guild_type_start ON contents(guild_id, content_type, start_ts)")
     await DB.execute("CREATE INDEX IF NOT EXISTS idx_awards_guild_user ON attendance_awards(guild_id, user_id)")
+    await DB.execute("CREATE INDEX IF NOT EXISTS idx_balevents_guild_user ON balance_events(guild_id, user_id)")
     await DB.commit()
 
 
@@ -465,6 +498,58 @@ async def db_att_leaderboard_month(guild_id: int) -> List[Tuple[int, int]]:
 
 
 # =========================
+# BALANCE DB
+# =========================
+async def db_balance_get(guild_id: int, user_id: int) -> int:
+    cur = await DB.execute(
+        "SELECT amount FROM balances WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id)
+    )
+    row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def db_balance_apply(
+    guild_id: int, user_id: int, delta: int,
+    kind: str, reason: Optional[str], actor_id: int,
+) -> Tuple[int, int]:
+    """
+    Применяет дельту к балансу. Клампит снизу нулём (минимум 0).
+    Возвращает (new_balance, applied_delta) — applied_delta может отличаться от delta при клампе.
+    """
+    now = int(time.time())
+    await DB.execute("BEGIN IMMEDIATE")
+    try:
+        cur = await DB.execute(
+            "SELECT amount FROM balances WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id)
+        )
+        row = await cur.fetchone()
+        current = int(row[0]) if row else 0
+
+        new = current + delta
+        if new < 0:
+            new = 0
+        applied = new - current
+
+        await DB.execute(
+            """INSERT INTO balances (guild_id, user_id, amount, updated_at) VALUES (?, ?, ?, ?)
+               ON CONFLICT(guild_id, user_id) DO UPDATE SET amount = excluded.amount, updated_at = excluded.updated_at""",
+            (guild_id, user_id, new, now)
+        )
+        await DB.execute(
+            """INSERT INTO balance_events (guild_id, user_id, delta, balance_after, kind, reason, actor_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (guild_id, user_id, applied, new, kind, reason, actor_id, now)
+        )
+        await DB.commit()
+    except Exception:
+        await DB.rollback()
+        raise
+    return new, applied
+
+
+# =========================
 # HELPERS
 # =========================
 def ts_discord(unix_ts: int, fmt: str = "F") -> str:
@@ -494,11 +579,21 @@ def normalize_roles_lines(raw: str) -> List[str]:
     return [ln for ln in lines if ln]
 
 
-def is_organizer_or_admin(member: discord.Member, created_by: int) -> bool:
-    if member.id == created_by:
+def member_is_staff(member: discord.Member) -> bool:
+    p = member.guild_permissions
+    if p.administrator or p.manage_guild or p.manage_roles:
         return True
-    perms = member.guild_permissions
-    return perms.administrator or perms.manage_guild or perms.manage_roles
+    return bool(STAFF_ROLE_IDS & {r.id for r in member.roles})
+
+
+def is_organizer_or_admin(member: discord.Member, created_by: int) -> bool:
+    return member.id == created_by or member_is_staff(member)
+
+
+def get_member_safe(interaction: discord.Interaction) -> Optional[discord.Member]:
+    if interaction.guild is None:
+        return None
+    return interaction.guild.get_member(interaction.user.id)
 
 
 MENTION_ID_RE = re.compile(r"<@!?(\d+)>")
@@ -851,7 +946,7 @@ class OcrRoleView(discord.ui.View):
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
+bot = commands.Bot(command_prefix=commands.when_mentioned_or("!"), intents=intents)
 
 
 @bot.event
@@ -1216,6 +1311,10 @@ async def content_create(
     if photo is not None and not (photo.content_type or "").startswith("image/"):
         await interaction.response.send_message("Вложение должно быть картинкой.", ephemeral=True)
         return
+    member = get_member_safe(interaction)
+    if member is None or not member_is_staff(member):
+        await interaction.response.send_message("Недостаточно прав.", ephemeral=True)
+        return
     await interaction.response.send_modal(ContentCreateModal(content_type=type.value, photo=photo))
 
 
@@ -1235,6 +1334,9 @@ async def content_close(interaction: discord.Interaction, content_id: int):
     row = await db_get_content_by_id(content_id)
     if row is None:
         await interaction.response.send_message("Контент не найден.", ephemeral=True); return
+    member = get_member_safe(interaction)
+    if member is None or not is_organizer_or_admin(member, int(row["created_by"])):
+        await interaction.response.send_message("Недостаточно прав.", ephemeral=True); return
     await db_close_content(content_id)
     row2 = await db_get_content_by_id(content_id)
     if row2 and interaction.guild:
@@ -1254,6 +1356,9 @@ async def role_from_content(interaction: discord.Interaction, content_id: int, r
     guild = interaction.guild
     if guild is None:
         await interaction.followup.send("Guild недоступен."); return
+    member = guild.get_member(interaction.user.id)
+    if member is None or not member_is_staff(member):
+        await interaction.followup.send("Недостаточно прав."); return
     user_ids = await db_get_all_participants(content_id)
     if not user_ids:
         await interaction.followup.send("Нет участников."); return
@@ -1329,6 +1434,9 @@ async def role_clear(interaction: discord.Interaction, content_id: int):
     guild = interaction.guild
     if guild is None:
         await interaction.followup.send("Guild недоступен."); return
+    member = guild.get_member(interaction.user.id)
+    if member is None or not member_is_staff(member):
+        await interaction.followup.send("Недостаточно прав."); return
     role = guild.get_role(int(row["payout_role_id"])) if row["payout_role_id"] else None
     if role is None and row["payout_role_name"]:
         role = discord.utils.get(guild.roles, name=str(row["payout_role_name"]))
@@ -1489,6 +1597,139 @@ async def att_export_csv(interaction: discord.Interaction, scope: str = "month")
         color=COLOR_BLUE
     )
     await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+
+
+# =========================
+# BALANCE COMMANDS
+# =========================
+def fmt_money(n: int) -> str:
+    return f"{n:,}".replace(",", " ") + f" {CURRENCY}"
+
+
+@bot.command(name="bal")
+async def bal_prefix(ctx: commands.Context, member: Optional[discord.Member] = None):
+    """!bal — свой баланс; !bal @user — чужой (только стафф)."""
+    if ctx.guild is None:
+        return
+    target = member or ctx.author
+    if member is not None and member.id != ctx.author.id:
+        if not (isinstance(ctx.author, discord.Member) and member_is_staff(ctx.author)):
+            await ctx.reply("Чужой баланс может смотреть только стафф.", mention_author=False)
+            return
+    bal = await db_balance_get(ctx.guild.id, target.id)
+    await ctx.reply(
+        embed=discord.Embed(
+            description=f"Баланс {target.mention}: **{fmt_money(bal)}**",
+            color=COLOR_GOLD
+        ),
+        mention_author=False
+    )
+
+
+@bot.tree.command(name="balance", description="Показать баланс")
+@app_commands.describe(user="Пользователь (по умолчанию — ты)")
+async def balance(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Guild недоступен.", ephemeral=True); return
+    target = user or interaction.user
+    ephemeral = True
+    if user is not None and user.id != interaction.user.id:
+        member = get_member_safe(interaction)
+        if member is None or not member_is_staff(member):
+            await interaction.response.send_message("Чужой баланс может смотреть только стафф.", ephemeral=True)
+            return
+        ephemeral = False
+    bal = await db_balance_get(int(interaction.guild_id), int(target.id))
+    await interaction.response.send_message(
+        embed=discord.Embed(description=f"Баланс {target.mention}: **{fmt_money(bal)}**", color=COLOR_GOLD),
+        ephemeral=ephemeral
+    )
+
+
+@bot.tree.command(name="money_add", description="Начислить деньги пользователю (стафф)")
+@app_commands.describe(user="Кому", amount="Сколько (>0)", reason="Причина (опционально)")
+async def money_add(interaction: discord.Interaction, user: discord.Member, amount: int, reason: Optional[str] = None):
+    await interaction.response.defer(ephemeral=True)
+    member = get_member_safe(interaction)
+    if member is None or not member_is_staff(member):
+        await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
+    if amount <= 0:
+        await interaction.followup.send("Сумма должна быть > 0.", ephemeral=True); return
+    new, _ = await db_balance_apply(int(interaction.guild_id), int(user.id), amount,
+                                    "add", reason, int(interaction.user.id))
+    embed = discord.Embed(title="✅ Начислено", color=COLOR_GREEN,
+                          description=f"{user.mention}: +{fmt_money(amount)}\nНовый баланс: **{fmt_money(new)}**")
+    if reason:
+        embed.add_field(name="Причина", value=reason, inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="money_sub", description="Снять деньги у пользователя (стафф, минимум 0)")
+@app_commands.describe(user="У кого", amount="Сколько (>0)", reason="Причина (опционально)")
+async def money_sub(interaction: discord.Interaction, user: discord.Member, amount: int, reason: Optional[str] = None):
+    await interaction.response.defer(ephemeral=True)
+    member = get_member_safe(interaction)
+    if member is None or not member_is_staff(member):
+        await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
+    if amount <= 0:
+        await interaction.followup.send("Сумма должна быть > 0.", ephemeral=True); return
+    new, applied = await db_balance_apply(int(interaction.guild_id), int(user.id), -amount,
+                                          "sub", reason, int(interaction.user.id))
+    removed = -applied  # сколько реально сняли (с учётом клампа в 0)
+    embed = discord.Embed(title="✅ Снято", color=COLOR_YELLOW,
+                          description=f"{user.mention}: -{fmt_money(removed)}\nНовый баланс: **{fmt_money(new)}**")
+    if removed < amount:
+        embed.add_field(name="⚠️", value=f"Запрошено {fmt_money(amount)}, но баланс ушёл в 0.", inline=False)
+    if reason:
+        embed.add_field(name="Причина", value=reason, inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="money_payout_role", description="Начислить деньги всем с ролью (стафф)")
+@app_commands.describe(role="Роль", amount="Сколько каждому (>0)", reason="Причина (опционально)")
+async def money_payout_role(interaction: discord.Interaction, role: discord.Role, amount: int, reason: Optional[str] = None):
+    await interaction.response.defer(ephemeral=True)
+    member = get_member_safe(interaction)
+    if member is None or not member_is_staff(member):
+        await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
+    if amount <= 0:
+        await interaction.followup.send("Сумма должна быть > 0.", ephemeral=True); return
+    targets = [m for m in role.members if not m.bot]
+    if not targets:
+        await interaction.followup.send("У роли нет участников.", ephemeral=True); return
+    for m in targets:
+        await db_balance_apply(int(interaction.guild_id), int(m.id), amount,
+                               "payout_role", reason or f"role:{role.name}", int(interaction.user.id))
+    embed = discord.Embed(title="✅ Массовое начисление", color=COLOR_GREEN,
+                          description=f"Роль {role.mention}: +{fmt_money(amount)} каждому\nПолучателей: **{len(targets)}**")
+    if reason:
+        embed.add_field(name="Причина", value=reason, inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="money_payout_content", description="Начислить деньги всем участникам контента (стафф)")
+@app_commands.describe(content_id="ID контента", amount="Сколько каждому (>0)", reason="Причина (опционально)")
+async def money_payout_content(interaction: discord.Interaction, content_id: int, amount: int, reason: Optional[str] = None):
+    await interaction.response.defer(ephemeral=True)
+    row = await db_get_content_by_id(content_id)
+    if row is None:
+        await interaction.followup.send("Контент не найден.", ephemeral=True); return
+    member = get_member_safe(interaction)
+    if member is None or not is_organizer_or_admin(member, int(row["created_by"])):
+        await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
+    if amount <= 0:
+        await interaction.followup.send("Сумма должна быть > 0.", ephemeral=True); return
+    user_ids = await db_get_all_participants(content_id)
+    if not user_ids:
+        await interaction.followup.send("Нет участников.", ephemeral=True); return
+    for uid in user_ids:
+        await db_balance_apply(int(interaction.guild_id), int(uid), amount,
+                               "payout_content", reason or f"content:{content_id}", int(interaction.user.id))
+    embed = discord.Embed(title="✅ Выплата за контент", color=COLOR_GREEN,
+                          description=f"Контент **#{content_id}**: +{fmt_money(amount)} каждому\nПолучателей: **{len(user_ids)}**")
+    if reason:
+        embed.add_field(name="Причина", value=reason, inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # =========================
