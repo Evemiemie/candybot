@@ -46,6 +46,16 @@ STAFF_ROLE_IDS: Set[int] = {
     int(x) for x in os.getenv("STAFF_ROLE_IDS", "").replace(" ", "").split(",") if x.isdigit()
 }
 
+# RL роли — могут /content_create. .env: RL_ROLE_IDS=111,222
+RL_ROLE_IDS: Set[int] = {
+    int(x) for x in os.getenv("RL_ROLE_IDS", "").replace(" ", "").split(",") if x.isdigit()
+}
+
+# Рекрут — только мемберские команды. .env: RECRUIT_ROLE_IDS=333,444
+RECRUIT_ROLE_IDS: Set[int] = {
+    int(x) for x in os.getenv("RECRUIT_ROLE_IDS", "").replace(" ", "").split(",") if x.isdigit()
+}
+
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 
 COLOR_BLUE   = 0x5865F2
@@ -612,6 +622,21 @@ def member_is_staff(member: discord.Member) -> bool:
     return bool(STAFF_ROLE_IDS & {r.id for r in member.roles})
 
 
+def member_is_rl(member: discord.Member) -> bool:
+    """RL — может /content_create."""
+    return bool(RL_ROLE_IDS & {r.id for r in member.roles})
+
+
+def member_is_recruit(member: discord.Member) -> bool:
+    """Рекрут — только мемберские команды."""
+    return bool(RECRUIT_ROLE_IDS & {r.id for r in member.roles})
+
+
+def member_can_create_content(member: discord.Member) -> bool:
+    """Создавать контент: стафф + RL."""
+    return member_is_staff(member) or member_is_rl(member)
+
+
 def is_organizer_or_admin(member: discord.Member, created_by: int) -> bool:
     return member.id == created_by or member_is_staff(member)
 
@@ -673,16 +698,14 @@ def build_main_post_embed(content_row, roster, attendance_only) -> discord.Embed
     status_str = "🟢 Open" if status == STATUS_OPEN else "🔴 Closed"
     embed.add_field(name="Status", value=status_str, inline=True)
     embed.add_field(name="Players", value=f"**{participants_count}**", inline=True)
-    embed.add_field(name="ID", value=f"`{message_id}`", inline=True)
-
-    if thread_id:
-        embed.add_field(name="💬 Thread", value=f"<#{thread_id}>", inline=True)
+    embed.add_field(name="Content ID", value=f"`{content_id}`", inline=True)
 
     # Роли (чанками по лимиту embed-поля).
     roles_fmt = []
     for i, role_name in enumerate(roles_lines, start=1):
         uid = by_index.get(i)
         roles_fmt.append(f"`{i}.` {role_name} — <@{uid}>" if uid else f"`{i}.` {role_name} —")
+        roles_fmt.append("")  # воздух между слотами
 
     chunk, chunk_size, field_num = [], 0, 0
     for line in roles_fmt:
@@ -706,7 +729,7 @@ def build_main_post_embed(content_row, roster, attendance_only) -> discord.Embed
 
     embed.add_field(
         name="📖 В ветке",
-        value="➣ `1` — занять роль (если свободна)\n➣ `-` — выписаться с роли",
+        value="➣ `1` — занять роль (если свободна)\n➣ `-` — выписаться с роли\n➣ `+хилл @user` — добавить с меткой (стафф)",
         inline=False
     )
 
@@ -741,9 +764,13 @@ def parse_thread_command(text: str) -> Tuple[str, Optional[int]]:
         return "self_leave", None
     if t.isdigit():
         return "self_join", int(t)
+    # +2 @user — назначить слот по номеру
     m = re.match(r"^\+(\d+)\s+.+$", t)
     if m:
         return "org_assign_slot", int(m.group(1))
+    # +метка @user — доп. участник с подписью роли
+    if t.startswith("+") and re.search(r"<@!?\d+>", t) and not re.match(r"^\+\d+\s", t):
+        return "org_assign_label", None
     if t.startswith("+"):
         return "org_attend_add", None
     m = re.match(r"^-(\d+)$", t)
@@ -1203,6 +1230,12 @@ async def on_message(message: discord.Message):
             description=(
                 "`<цифра>` — занять роль с указанным номером\n"
                 "`-` — выписаться со своей роли\n\n"
+                "**Стафф:**\n"
+                "`+хилл @user` — добавить с меткой роли\n"
+                "`+2 @user` — поставить @user на слот №2\n"
+                "`-2` — освободить слот №2\n"
+                "`- @user` — выписать @user\n"
+                "`+ @user1 @user2` — добавить как доп. участников\n\n"
                 "Если самозапись закрыта — обратитесь к организатору."
             )
         ), mention_author=False)
@@ -1254,6 +1287,24 @@ async def on_message(message: discord.Message):
         target = message.mentions[0]
         ok, txt = await db_assign_user(content_id, target.id, int(num))
         await message.reply(f"{target.mention}: {txt}", mention_author=False)
+        row2 = await db_get_content_by_id(content_id)
+        if row2:
+            await refresh_main_post(message.guild, row2)
+        await _try_delete_command(message)
+        return
+
+    if kind == "org_assign_label":
+        if not is_org:
+            await message.reply("Недостаточно прав.", mention_author=False); return
+        if not message.mentions:
+            await message.reply("Формат: `+хилл @user`", mention_author=False); return
+        label_match = re.match(r"^\+(.+?)\s+<@", cmd)
+        label = label_match.group(1).strip() if label_match else "доп. роль"
+        target = message.mentions[0]
+        added, already = await db_attend_add_many(content_id, [target.id], message.author.id)
+        status_txt = "уже записан" if already else "добавлен"
+        await message.reply(f"{target.mention} — **{label}** ({status_txt})", mention_author=False)
+        await message.add_reaction("\u2705")
         row2 = await db_get_content_by_id(content_id)
         if row2:
             await refresh_main_post(message.guild, row2)
@@ -1338,8 +1389,8 @@ async def content_create(
         await interaction.response.send_message("Вложение должно быть картинкой.", ephemeral=True)
         return
     member = get_member_safe(interaction)
-    if member is None or not member_is_staff(member):
-        await interaction.response.send_message("Недостаточно прав.", ephemeral=True)
+    if member is None or not member_can_create_content(member):
+        await interaction.response.send_message("Недостаточно прав. Требуется роль стаффа или RL.", ephemeral=True)
         return
     await interaction.response.send_modal(ContentCreateModal(content_type=type.value, photo=photo))
 
@@ -1643,13 +1694,9 @@ async def bal_prefix(ctx: commands.Context, member: Optional[discord.Member] = N
             await ctx.reply("Чужой баланс может смотреть только стафф.", mention_author=False)
             return
     bal = await db_balance_get(ctx.guild.id, target.id)
-    await ctx.reply(
-        embed=discord.Embed(
-            description=f"Баланс {target.mention}: **{fmt_money(bal)}**",
-            color=COLOR_GOLD
-        ),
-        mention_author=False
-    )
+    embed = discord.Embed(color=COLOR_GOLD)
+    embed.add_field(name=f"\U0001fa99 Баланс · {target.display_name}", value=f"**{fmt_money(bal)}**", inline=False)
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.tree.command(name="balance", description="Показать баланс")
@@ -1666,10 +1713,9 @@ async def balance(interaction: discord.Interaction, user: Optional[discord.Membe
             return
         ephemeral = False
     bal = await db_balance_get(int(interaction.guild_id), int(target.id))
-    await interaction.response.send_message(
-        embed=discord.Embed(description=f"Баланс {target.mention}: **{fmt_money(bal)}**", color=COLOR_GOLD),
-        ephemeral=ephemeral
-    )
+    embed = discord.Embed(color=COLOR_GOLD)
+    embed.add_field(name=f"\U0001fa99 Баланс · {target.display_name}", value=f"**{fmt_money(bal)}**", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
 
 
 @bot.tree.command(name="money_add", description="Начислить деньги пользователю (стафф)")
@@ -1756,6 +1802,229 @@ async def money_payout_content(interaction: discord.Interaction, content_id: int
     if reason:
         embed.add_field(name="Причина", value=reason, inline=False)
     await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="content_copy", description="Скопировать кол: полное (с тегами) или упрощённое (структура)")
+@app_commands.describe(
+    content_id="ID контента",
+    mode="full = с тегами участников, simple = только структура"
+)
+@app_commands.choices(mode=[
+    app_commands.Choice(name="Полное (с тегами участников)", value="full"),
+    app_commands.Choice(name="Упрощённое (структура без людей)", value="simple"),
+])
+async def content_copy(interaction: discord.Interaction, content_id: int, mode: str = "simple"):
+    await interaction.response.defer(ephemeral=True)
+    row = await db_get_content_by_id(content_id)
+    if row is None:
+        await interaction.followup.send("Контент не найден.", ephemeral=True); return
+    member = get_member_safe(interaction)
+    if member is None or not member_is_staff(member):
+        await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
+
+    title = str(row["title"])
+    roles_lines = normalize_roles_lines(str(row["roles_text"]))
+    start_ts = int(row["start_ts"]) if row["start_ts"] else None
+    after_text = str(row["after_text"]).strip() if row["after_text"] else None
+    builds_link = str(row["builds_link"]) if row["builds_link"] else None
+    content_type = str(row["content_type"])
+
+    if mode == "full":
+        roster = await db_get_roster(content_id)
+        attend = await db_attend_list(content_id)
+        by_index = {idx: uid for idx, uid in roster}
+        roster_uids = {uid for _, uid in roster}
+        attendance_only = [uid for uid in attend if uid not in roster_uids]
+        lines = [f"**Контент: {title}**", f"Тип: {type_label(content_type)}"]
+        if start_ts:
+            utc_str = datetime.datetime.fromtimestamp(start_ts, tz=datetime.timezone.utc).strftime("%H:%M UTC")
+            lines.append(f"\u23f0 Be ready by: {utc_str} ({ts_discord(start_ts, 'F')})")
+        if builds_link:
+            lines.append(f"\U0001f517 Билды: {builds_link}")
+        lines.extend(["", "**\U0001f4dd Роли:**"])
+        for i, role_name in enumerate(roles_lines, start=1):
+            uid = by_index.get(i)
+            lines.append(f"`{i}.` {role_name} — <@{uid}>" if uid else f"`{i}.` {role_name} —")
+        if attendance_only:
+            lines.extend(["", "**\u2795 Дополнительно:**"])
+            for uid in attendance_only:
+                lines.append(f"\u2022 <@{uid}>")
+        if after_text:
+            lines.extend(["", f"\U0001f4cc {after_text}"])
+    else:
+        lines = [f"**Контент: {title}**", f"Тип: {type_label(content_type)}"]
+        if start_ts:
+            utc_str = datetime.datetime.fromtimestamp(start_ts, tz=datetime.timezone.utc).strftime("%H:%M UTC")
+            lines.append(f"\u23f0 Be ready by: {utc_str} ({ts_discord(start_ts, 'F')})")
+        if builds_link:
+            lines.append(f"\U0001f517 Билды: {builds_link}")
+        lines.extend(["", "**\U0001f4dd Роли:**"])
+        for i, role_name in enumerate(roles_lines, start=1):
+            lines.append(f"`{i}.` {role_name}")
+        if after_text:
+            lines.extend(["", f"\U0001f4cc {after_text}"])
+
+    text = "\n".join(lines)
+    if len(text) <= 1900:
+        await interaction.followup.send(content=text, ephemeral=True)
+    else:
+        buf = io.BytesIO(text.encode("utf-8"))
+        file = discord.File(buf, filename=f"content_{content_id}_copy.txt")
+        await interaction.followup.send(
+            content=f"Копия контента **#{content_id}**:",
+            file=file, ephemeral=True
+        )
+
+
+# =========================
+# PREFIX COMMANDS — STAFF ONLY
+# =========================
+
+@bot.command(name="add-money")
+async def prefix_add_money(ctx: commands.Context, member: discord.Member, amount: int, *, reason: Optional[str] = None):
+    """!add-money @user <сумма> [причина] — начислить деньги (стафф)."""
+    if ctx.guild is None: return
+    if not (isinstance(ctx.author, discord.Member) and member_is_staff(ctx.author)):
+        await ctx.reply("\u274c Только стафф.", mention_author=False); return
+    if amount <= 0:
+        await ctx.reply("Сумма должна быть > 0.", mention_author=False); return
+    new, _ = await db_balance_apply(ctx.guild.id, member.id, amount, "add", reason, ctx.author.id)
+    embed = discord.Embed(title="\u2705 Начислено", color=COLOR_GREEN)
+    embed.add_field(name=f"\U0001fa99 {member.display_name}", value=f"+{fmt_money(amount)}\nНовый баланс: **{fmt_money(new)}**", inline=False)
+    if reason:
+        embed.add_field(name="Причина", value=reason, inline=False)
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="remove-money")
+async def prefix_remove_money(ctx: commands.Context, member: discord.Member, amount: int, *, reason: Optional[str] = None):
+    """!remove-money @user <сумма> [причина] — снять деньги (стафф)."""
+    if ctx.guild is None: return
+    if not (isinstance(ctx.author, discord.Member) and member_is_staff(ctx.author)):
+        await ctx.reply("\u274c Только стафф.", mention_author=False); return
+    if amount <= 0:
+        await ctx.reply("Сумма должна быть > 0.", mention_author=False); return
+    new, applied = await db_balance_apply(ctx.guild.id, member.id, -amount, "sub", reason, ctx.author.id)
+    removed = -applied
+    embed = discord.Embed(title="\u2705 Снято", color=COLOR_YELLOW)
+    embed.add_field(name=f"\U0001fa99 {member.display_name}", value=f"-{fmt_money(removed)}\nНовый баланс: **{fmt_money(new)}**", inline=False)
+    if removed < amount:
+        embed.add_field(name="\u26a0\ufe0f", value="Баланс обнулён (было меньше запрошенного).", inline=False)
+    if reason:
+        embed.add_field(name="Причина", value=reason, inline=False)
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="add-money-role")
+async def prefix_add_money_role(ctx: commands.Context, role: discord.Role, amount: int, *, reason: Optional[str] = None):
+    """!add-money-role @role <сумма> [причина] — начислить всем с ролью (стафф)."""
+    if ctx.guild is None: return
+    if not (isinstance(ctx.author, discord.Member) and member_is_staff(ctx.author)):
+        await ctx.reply("\u274c Только стафф.", mention_author=False); return
+    if amount <= 0:
+        await ctx.reply("Сумма должна быть > 0.", mention_author=False); return
+    targets = [m for m in role.members if not m.bot]
+    if not targets:
+        await ctx.reply("У роли нет участников.", mention_author=False); return
+    for m in targets:
+        await db_balance_apply(ctx.guild.id, m.id, amount, "payout_role", reason or f"role:{role.name}", ctx.author.id)
+    embed = discord.Embed(title="\u2705 Массовое начисление", color=COLOR_GREEN)
+    embed.add_field(name=f"\U0001fa99 {role.name}", value=f"+{fmt_money(amount)} каждому\nПолучателей: **{len(targets)}**", inline=False)
+    if reason:
+        embed.add_field(name="Причина", value=reason, inline=False)
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+# =========================
+# PREFIX COMMANDS — ALL MEMBERS
+# =========================
+
+@bot.command(name="lb")
+async def prefix_lb(ctx: commands.Context):
+    """!lb — лидерборд посещаемости за текущий месяц."""
+    if ctx.guild is None: return
+    rows = await db_att_leaderboard_month(ctx.guild.id)
+    my_count = next((cnt for uid, cnt in rows if uid == ctx.author.id), 0)
+    view = LeaderboardView(rows=rows, guild=ctx.guild, requester_id=ctx.author.id, my_count=my_count)
+    await ctx.reply(embed=view.build_embed(), view=view, mention_author=False)
+
+
+@bot.command(name="att")
+async def prefix_att(ctx: commands.Context, target_member: Optional[discord.Member] = None):
+    """!att — своя посещаемость; !att @user — чужая (доступно всем)."""
+    if ctx.guild is None: return
+    target = target_member or ctx.author
+    data = await db_att_profile(ctx.guild.id, int(target.id), "month")
+    if data is None:
+        await ctx.reply(f"{target.mention} ещё ни разу не аттендил.", mention_author=False); return
+    joined_str = datetime.datetime.fromtimestamp(data["joined_at"], tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+    m_data, o_data = data[TYPE_MANDATORY], data[TYPE_OPTIONAL]
+    embed = discord.Embed(
+        title=f"\U0001f4ca Посещаемость \u00b7 {getattr(target, 'display_name', target.name)}",
+        description=f"Период: **текущий месяц**\nВ сборах с: `{joined_str}`",
+        color=COLOR_BLUE
+    )
+    embed.add_field(
+        name="\U0001f534 Обязательные",
+        value=f"Ивентов: {m_data['total']}\nПосещено: {m_data['attended']}\nПроцент: **{m_data['pct']} %**",
+        inline=True,
+    )
+    embed.add_field(
+        name="\U0001f7e2 Необязательные",
+        value=f"Ивентов: {o_data['total']}\nПосещено: {o_data['attended']}\nПроцент: **{o_data['pct']} %**",
+        inline=True,
+    )
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="economy-stats")
+async def prefix_economy_stats(ctx: commands.Context):
+    """!economy-stats — общая статистика экономики гильдии (стафф)."""
+    if ctx.guild is None: return
+    if not (isinstance(ctx.author, discord.Member) and member_is_staff(ctx.author)):
+        await ctx.reply("\u274c Только стафф.", mention_author=False); return
+
+    # Текущие балансы на руках (сумма всего, что сейчас у участников)
+    cur = await DB.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM balances WHERE guild_id = ?",
+        (ctx.guild.id,)
+    )
+    total_bank = int((await cur.fetchone())[0])
+
+    # Всего начислено за всё время (сумма всех положительных delta)
+    cur = await DB.execute(
+        "SELECT COALESCE(SUM(delta), 0) FROM balance_events WHERE guild_id = ? AND delta > 0",
+        (ctx.guild.id,)
+    )
+    total_awarded = int((await cur.fetchone())[0])
+
+    # Всего участников с ненулевым балансом
+    cur = await DB.execute(
+        "SELECT COUNT(*) FROM balances WHERE guild_id = ? AND amount > 0",
+        (ctx.guild.id,)
+    )
+    holders = int((await cur.fetchone())[0])
+
+    embed = discord.Embed(
+        title="\U0001f3e6  Economy Stats",
+        color=0x1a1f3c
+    )
+    embed.add_field(
+        name="\U0001f4b0 Total Awarded:",
+        value=f"**{fmt_money(total_awarded)}**",
+        inline=False
+    )
+    embed.add_field(
+        name="\U0001f3e6 Total Bank:",
+        value=f"**{fmt_money(total_bank)}**",
+        inline=False
+    )
+    embed.add_field(
+        name="\U0001f465 Holders:",
+        value=f"**{holders}**",
+        inline=False
+    )
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 # =========================
