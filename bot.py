@@ -3,6 +3,7 @@ import re
 import io
 import csv
 import time
+import asyncio
 import datetime
 from typing import Optional, List, Tuple, Set
 
@@ -69,6 +70,7 @@ COLOR_GOLD   = 0xF1C40F
 # aiosqlite сериализует операции через свой воркер-поток => безопасно для конкурентных await,
 # а WAL + busy_timeout убирают "database is locked".
 DB: Optional[aiosqlite.Connection] = None
+DB_WLOCK = asyncio.Lock()  # сериализует write-транзакции на общем коннекте
 
 
 # =========================
@@ -123,6 +125,7 @@ async def db_init() -> None:
         user_id INTEGER NOT NULL,
         added_by INTEGER NOT NULL,
         added_at INTEGER NOT NULL,
+        label TEXT,
         PRIMARY KEY (content_id, user_id)
     );
     """)
@@ -194,6 +197,7 @@ async def db_init() -> None:
         "ALTER TABLE contents ADD COLUMN photo_url TEXT",
         "ALTER TABLE contents ADD COLUMN hosted_by TEXT",
         "ALTER TABLE contents ADD COLUMN start_ts INTEGER",
+        "ALTER TABLE content_attendance ADD COLUMN label TEXT",
     ]
     for sql in migrations:
         try:
@@ -288,33 +292,34 @@ async def db_set_payout_role(content_id: int, role_id: int, role_name: str) -> N
 
 # ---------- slots ----------
 async def db_assign_user(content_id: int, user_id: int, role_index: int) -> Tuple[bool, str]:
-    # BEGIN IMMEDIATE лочит запись сразу => нет гонки "двое заняли один слот".
-    await DB.execute("BEGIN IMMEDIATE")
-    try:
-        cur = await DB.execute(
-            "SELECT user_id FROM content_assignments WHERE content_id = ? AND role_index = ?",
-            (content_id, role_index)
-        )
-        row = await cur.fetchone()
-        if row is not None and int(row[0]) != int(user_id):
+    # asyncio-лок + BEGIN IMMEDIATE => нет interleaving чужого BEGIN на общем коннекте.
+    async with DB_WLOCK:
+        await DB.execute("BEGIN IMMEDIATE")
+        try:
+            cur = await DB.execute(
+                "SELECT user_id FROM content_assignments WHERE content_id = ? AND role_index = ?",
+                (content_id, role_index)
+            )
+            row = await cur.fetchone()
+            if row is not None and int(row[0]) != int(user_id):
+                await DB.rollback()
+                return False, "Роль занята."
+
+            await DB.execute(
+                "DELETE FROM content_assignments WHERE content_id = ? AND user_id = ?",
+                (content_id, user_id)
+            )
+            await DB.execute(
+                "INSERT INTO content_assignments (content_id, user_id, role_index, assigned_at) VALUES (?, ?, ?, ?)",
+                (content_id, user_id, role_index, int(time.time()))
+            )
+            await DB.commit()
+        except aiosqlite.IntegrityError:
             await DB.rollback()
             return False, "Роль занята."
-
-        await DB.execute(
-            "DELETE FROM content_assignments WHERE content_id = ? AND user_id = ?",
-            (content_id, user_id)
-        )
-        await DB.execute(
-            "INSERT INTO content_assignments (content_id, user_id, role_index, assigned_at) VALUES (?, ?, ?, ?)",
-            (content_id, user_id, role_index, int(time.time()))
-        )
-        await DB.commit()
-    except aiosqlite.IntegrityError:
-        await DB.rollback()
-        return False, "Роль занята."
-    except Exception:
-        await DB.rollback()
-        raise
+        except Exception:
+            await DB.rollback()
+            raise
     return True, f"Записан на роль {role_index}."
 
 
@@ -354,18 +359,24 @@ async def db_get_roster(content_id: int) -> List[Tuple[int, int]]:
 
 
 # ---------- attendance (per-content presence) ----------
-async def db_attend_add_many(content_id: int, user_ids: List[int], added_by: int) -> Tuple[int, int]:
+async def db_attend_add_many(content_id: int, user_ids: List[int], added_by: int,
+                             label: Optional[str] = None) -> Tuple[int, int]:
     added = already = 0
     now = int(time.time())
     for uid in user_ids:
         try:
             await DB.execute(
-                "INSERT INTO content_attendance (content_id, user_id, added_by, added_at) VALUES (?, ?, ?, ?)",
-                (content_id, uid, added_by, now)
+                "INSERT INTO content_attendance (content_id, user_id, added_by, added_at, label) VALUES (?, ?, ?, ?, ?)",
+                (content_id, uid, added_by, now, label)
             )
             added += 1
         except aiosqlite.IntegrityError:
             already += 1
+            if label is not None:  # перезаписали метку, если уже был в доп
+                await DB.execute(
+                    "UPDATE content_attendance SET label = ? WHERE content_id = ? AND user_id = ?",
+                    (label, content_id, uid)
+                )
     await DB.commit()
     return added, already
 
@@ -386,6 +397,15 @@ async def db_attend_list(content_id: int) -> List[int]:
     )
     rows = await cur.fetchall()
     return [int(r[0]) for r in rows]
+
+
+async def db_attend_list_labeled(content_id: int) -> List[Tuple[int, Optional[str]]]:
+    cur = await DB.execute(
+        "SELECT user_id, label FROM content_attendance WHERE content_id = ? ORDER BY added_at ASC",
+        (content_id,)
+    )
+    rows = await cur.fetchall()
+    return [(int(r[0]), (str(r[1]) if r[1] else None)) for r in rows]
 
 
 async def db_get_all_participants(content_id: int) -> List[int]:
@@ -411,26 +431,32 @@ async def db_att_award_for_content(
 ) -> Tuple[int, int]:
     now = int(time.time())
     awarded = already = 0
-    for uid in user_ids:
-        # joined_at = время первого НАЧИСЛЕНИЯ ("начал аттендить"), неизменно
-        await DB.execute(
-            "INSERT OR IGNORE INTO attendance_join (guild_id, user_id, joined_at) VALUES (?, ?, ?)",
-            (guild_id, uid, now)
-        )
+    async with DB_WLOCK:
+        await DB.execute("BEGIN IMMEDIATE")
         try:
-            await DB.execute(
-                "INSERT INTO attendance_awards (guild_id, content_id, user_id, awarded_by, awarded_at) VALUES (?, ?, ?, ?, ?)",
-                (guild_id, content_id, uid, awarded_by, now)
-            )
-        except aiosqlite.IntegrityError:
-            already += 1
-            continue
-        await DB.execute(
-            "INSERT INTO attendance_events (guild_id, user_id, content_id, delta, kind, actor_id, created_at) VALUES (?, ?, ?, 1, 'content_award', ?, ?)",
-            (guild_id, uid, content_id, awarded_by, now)
-        )
-        awarded += 1
-    await DB.commit()
+            for uid in user_ids:
+                # joined_at = время первого НАЧИСЛЕНИЯ ("начал аттендить"), неизменно
+                await DB.execute(
+                    "INSERT OR IGNORE INTO attendance_join (guild_id, user_id, joined_at) VALUES (?, ?, ?)",
+                    (guild_id, uid, now)
+                )
+                try:
+                    await DB.execute(
+                        "INSERT INTO attendance_awards (guild_id, content_id, user_id, awarded_by, awarded_at) VALUES (?, ?, ?, ?, ?)",
+                        (guild_id, content_id, uid, awarded_by, now)
+                    )
+                except aiosqlite.IntegrityError:
+                    already += 1
+                    continue
+                await DB.execute(
+                    "INSERT INTO attendance_events (guild_id, user_id, content_id, delta, kind, actor_id, created_at) VALUES (?, ?, ?, 1, 'content_award', ?, ?)",
+                    (guild_id, uid, content_id, awarded_by, now)
+                )
+                awarded += 1
+            await DB.commit()
+        except Exception:
+            await DB.rollback()
+            raise
     return awarded, already
 
 
@@ -545,6 +571,36 @@ async def db_balance_get(guild_id: int, user_id: int) -> int:
     return int(row[0]) if row else 0
 
 
+async def _balance_apply_tx(
+    guild_id: int, user_id: int, delta: int,
+    kind: str, reason: Optional[str], actor_id: int, now: int,
+) -> Tuple[int, int]:
+    """Ядро начисления. Вызывать ТОЛЬКО внутри DB_WLOCK + открытой транзакции."""
+    cur = await DB.execute(
+        "SELECT amount FROM balances WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id)
+    )
+    row = await cur.fetchone()
+    current = int(row[0]) if row else 0
+
+    new = current + delta
+    if new < 0:
+        new = 0
+    applied = new - current
+
+    await DB.execute(
+        """INSERT INTO balances (guild_id, user_id, amount, updated_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT(guild_id, user_id) DO UPDATE SET amount = excluded.amount, updated_at = excluded.updated_at""",
+        (guild_id, user_id, new, now)
+    )
+    await DB.execute(
+        """INSERT INTO balance_events (guild_id, user_id, delta, balance_after, kind, reason, actor_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (guild_id, user_id, applied, new, kind, reason, actor_id, now)
+    )
+    return new, applied
+
+
 async def db_balance_apply(
     guild_id: int, user_id: int, delta: int,
     kind: str, reason: Optional[str], actor_id: int,
@@ -554,35 +610,32 @@ async def db_balance_apply(
     Возвращает (new_balance, applied_delta) — applied_delta может отличаться от delta при клампе.
     """
     now = int(time.time())
-    await DB.execute("BEGIN IMMEDIATE")
-    try:
-        cur = await DB.execute(
-            "SELECT amount FROM balances WHERE guild_id = ? AND user_id = ?",
-            (guild_id, user_id)
-        )
-        row = await cur.fetchone()
-        current = int(row[0]) if row else 0
+    async with DB_WLOCK:
+        await DB.execute("BEGIN IMMEDIATE")
+        try:
+            res = await _balance_apply_tx(guild_id, user_id, delta, kind, reason, actor_id, now)
+            await DB.commit()
+        except Exception:
+            await DB.rollback()
+            raise
+    return res
 
-        new = current + delta
-        if new < 0:
-            new = 0
-        applied = new - current
 
-        await DB.execute(
-            """INSERT INTO balances (guild_id, user_id, amount, updated_at) VALUES (?, ?, ?, ?)
-               ON CONFLICT(guild_id, user_id) DO UPDATE SET amount = excluded.amount, updated_at = excluded.updated_at""",
-            (guild_id, user_id, new, now)
-        )
-        await DB.execute(
-            """INSERT INTO balance_events (guild_id, user_id, delta, balance_after, kind, reason, actor_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (guild_id, user_id, applied, new, kind, reason, actor_id, now)
-        )
-        await DB.commit()
-    except Exception:
-        await DB.rollback()
-        raise
-    return new, applied
+async def db_balance_payout_many(
+    guild_id: int, user_ids: List[int], amount: int,
+    kind: str, reason: Optional[str], actor_id: int,
+) -> None:
+    """Атомарная массовая выплата: всё в одной транзакции (all-or-nothing => нет двойных выплат при падении)."""
+    now = int(time.time())
+    async with DB_WLOCK:
+        await DB.execute("BEGIN IMMEDIATE")
+        try:
+            for uid in user_ids:
+                await _balance_apply_tx(guild_id, uid, amount, kind, reason, actor_id, now)
+            await DB.commit()
+        except Exception:
+            await DB.rollback()
+            raise
 
 
 # =========================
@@ -666,8 +719,6 @@ def build_main_post_embed(content_row, roster, attendance_only) -> discord.Embed
     content_id = int(content_row["id"])
     title = str(content_row["title"])
     status = str(content_row["status"])
-    message_id = int(content_row["message_id"])
-    thread_id = int(content_row["thread_id"]) if content_row["thread_id"] else None
     roles_lines = normalize_roles_lines(str(content_row["roles_text"]))
     after_text = str(content_row["after_text"]) if content_row["after_text"] else None
     hosted_by = str(content_row["hosted_by"]) if content_row["hosted_by"] else None
@@ -705,7 +756,6 @@ def build_main_post_embed(content_row, roster, attendance_only) -> discord.Embed
     for i, role_name in enumerate(roles_lines, start=1):
         uid = by_index.get(i)
         roles_fmt.append(f"`{i}.` {role_name} — <@{uid}>" if uid else f"`{i}.` {role_name} —")
-        roles_fmt.append("")  # воздух между слотами
 
     chunk, chunk_size, field_num = [], 0, 0
     for line in roles_fmt:
@@ -718,7 +768,9 @@ def build_main_post_embed(content_row, roster, attendance_only) -> discord.Embed
 
     if attendance_only:
         start = len(roles_lines) + 1
-        att_lines = [f"`{j}.` <@{uid}>" for j, uid in enumerate(attendance_only, start=start)]
+        att_lines = []
+        for j, (uid, lbl) in enumerate(attendance_only, start=start):
+            att_lines.append(f"`{j}.` {lbl} — <@{uid}>" if lbl else f"`{j}.` <@{uid}>")
         embed.add_field(name="➕ Additionally", value="\n".join(att_lines[:20]), inline=False)
 
     if builds_link:
@@ -729,7 +781,7 @@ def build_main_post_embed(content_row, roster, attendance_only) -> discord.Embed
 
     embed.add_field(
         name="📖 В ветке",
-        value="➣ `1` — занять роль (если свободна)\n➣ `-` — выписаться с роли\n➣ `+хилл @user` — добавить с меткой (стафф)",
+        value="➣ `1` — занять роль (если свободна)\n➣ `-` — выписаться с роли",
         inline=False
     )
 
@@ -746,13 +798,14 @@ async def refresh_main_post(guild: discord.Guild, content_row) -> None:
             return
         msg = await channel.fetch_message(int(content_row["message_id"]))
         roster = await db_get_roster(int(content_row["id"]))
-        attend = await db_attend_list(int(content_row["id"]))
+        attend = await db_attend_list_labeled(int(content_row["id"]))
         roster_uids = {uid for _, uid in roster}
-        attendance_only = [uid for uid in attend if uid not in roster_uids]
+        attendance_only = [(uid, lbl) for uid, lbl in attend if uid not in roster_uids]
         embed = build_main_post_embed(content_row, roster, attendance_only)
         # attachments не трогаем => фото (аттач этого же сообщения) остаётся валидным.
         await msg.edit(content=None, embed=embed)
-    except Exception:
+    except Exception as e:
+        print(f"[refresh_main_post] content={content_row['id']}: {e!r}")
         return
 
 
@@ -1242,7 +1295,11 @@ async def on_message(message: discord.Message):
         return
 
     if status != STATUS_OPEN and not is_org:
-        await message.reply("🔴 Запись закрыта.", mention_author=False)
+        await _try_delete_command(message)                 # убираем команду
+        try:
+            await message.channel.send("🔒 Запись закрыта.", delete_after=5)  # всплывающее, само удалится
+        except Exception:
+            pass
         return
 
     roles_lines = normalize_roles_lines(str(content["roles_text"]))
@@ -1301,8 +1358,8 @@ async def on_message(message: discord.Message):
         label_match = re.match(r"^\+(.+?)\s+<@", cmd)
         label = label_match.group(1).strip() if label_match else "доп. роль"
         target = message.mentions[0]
-        added, already = await db_attend_add_many(content_id, [target.id], message.author.id)
-        status_txt = "уже записан" if already else "добавлен"
+        added, already = await db_attend_add_many(content_id, [target.id], message.author.id, label=label)
+        status_txt = "метка обновлена" if already else "добавлен"
         await message.reply(f"{target.mention} — **{label}** ({status_txt})", mention_author=False)
         await message.add_reaction("\u2705")
         row2 = await db_get_content_by_id(content_id)
@@ -1769,9 +1826,8 @@ async def money_payout_role(interaction: discord.Interaction, role: discord.Role
     targets = [m for m in role.members if not m.bot]
     if not targets:
         await interaction.followup.send("У роли нет участников.", ephemeral=True); return
-    for m in targets:
-        await db_balance_apply(int(interaction.guild_id), int(m.id), amount,
-                               "payout_role", reason or f"role:{role.name}", int(interaction.user.id))
+    await db_balance_payout_many(int(interaction.guild_id), [int(m.id) for m in targets], amount,
+                                 "payout_role", reason or f"role:{role.name}", int(interaction.user.id))
     embed = discord.Embed(title="✅ Массовое начисление", color=COLOR_GREEN,
                           description=f"Роль {role.mention}: +{fmt_money(amount)} каждому\nПолучателей: **{len(targets)}**")
     if reason:
@@ -1794,9 +1850,8 @@ async def money_payout_content(interaction: discord.Interaction, content_id: int
     user_ids = await db_get_all_participants(content_id)
     if not user_ids:
         await interaction.followup.send("Нет участников.", ephemeral=True); return
-    for uid in user_ids:
-        await db_balance_apply(int(interaction.guild_id), int(uid), amount,
-                               "payout_content", reason or f"content:{content_id}", int(interaction.user.id))
+    await db_balance_payout_many(int(interaction.guild_id), [int(u) for u in user_ids], amount,
+                                 "payout_content", reason or f"content:{content_id}", int(interaction.user.id))
     embed = discord.Embed(title="✅ Выплата за контент", color=COLOR_GREEN,
                           description=f"Контент **#{content_id}**: +{fmt_money(amount)} каждому\nПолучателей: **{len(user_ids)}**")
     if reason:
@@ -1831,10 +1886,10 @@ async def content_copy(interaction: discord.Interaction, content_id: int, mode: 
 
     if mode == "full":
         roster = await db_get_roster(content_id)
-        attend = await db_attend_list(content_id)
+        attend = await db_attend_list_labeled(content_id)
         by_index = {idx: uid for idx, uid in roster}
         roster_uids = {uid for _, uid in roster}
-        attendance_only = [uid for uid in attend if uid not in roster_uids]
+        attendance_only = [(uid, lbl) for uid, lbl in attend if uid not in roster_uids]
         lines = [f"**Контент: {title}**", f"Тип: {type_label(content_type)}"]
         if start_ts:
             utc_str = datetime.datetime.fromtimestamp(start_ts, tz=datetime.timezone.utc).strftime("%H:%M UTC")
@@ -1847,8 +1902,8 @@ async def content_copy(interaction: discord.Interaction, content_id: int, mode: 
             lines.append(f"`{i}.` {role_name} — <@{uid}>" if uid else f"`{i}.` {role_name} —")
         if attendance_only:
             lines.extend(["", "**\u2795 Дополнительно:**"])
-            for uid in attendance_only:
-                lines.append(f"\u2022 <@{uid}>")
+            for uid, lbl in attendance_only:
+                lines.append(f"\u2022 {lbl} — <@{uid}>" if lbl else f"\u2022 <@{uid}>")
         if after_text:
             lines.extend(["", f"\U0001f4cc {after_text}"])
     else:
@@ -1926,8 +1981,8 @@ async def prefix_add_money_role(ctx: commands.Context, role: discord.Role, amoun
     targets = [m for m in role.members if not m.bot]
     if not targets:
         await ctx.reply("У роли нет участников.", mention_author=False); return
-    for m in targets:
-        await db_balance_apply(ctx.guild.id, m.id, amount, "payout_role", reason or f"role:{role.name}", ctx.author.id)
+    await db_balance_payout_many(ctx.guild.id, [m.id for m in targets], amount,
+                                 "payout_role", reason or f"role:{role.name}", ctx.author.id)
     embed = discord.Embed(title="\u2705 Массовое начисление", color=COLOR_GREEN)
     embed.add_field(name=f"\U0001fa99 {role.name}", value=f"+{fmt_money(amount)} каждому\nПолучателей: **{len(targets)}**", inline=False)
     if reason:
