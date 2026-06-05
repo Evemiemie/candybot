@@ -85,6 +85,17 @@ async def db_init() -> None:
     await DB.execute("PRAGMA foreign_keys=ON")
 
     await DB.execute("""
+    CREATE TABLE IF NOT EXISTS content_payouts (
+        guild_id INTEGER NOT NULL,
+        content_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        amount INTEGER NOT NULL,
+        paid_at INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, content_id, user_id)
+    );
+    """)
+
+    await DB.execute("""
     CREATE TABLE IF NOT EXISTS contents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         guild_id INTEGER NOT NULL,
@@ -245,26 +256,58 @@ async def db_create_content(
     start_ts: Optional[int] = None,
     builds_link: Optional[str] = None,
 ) -> int:
-    cur = await DB.execute(
-        """
-        INSERT INTO contents
-            (guild_id, channel_id, title, roles_text, after_text, ends_at, status,
-             created_by, created_at, hosted_by, start_ts, content_type, builds_link)
-        VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (guild_id, channel_id, title, roles_text, after_text, STATUS_OPEN,
-         created_by, int(time.time()), hosted_by, start_ts, content_type, builds_link)
-    )
-    await DB.commit()
-    return cur.lastrowid
+    async with DB_WLOCK:
+        cur = await DB.execute(
+            """
+            INSERT INTO contents
+                (guild_id, channel_id, title, roles_text, after_text, ends_at, status,
+                 created_by, created_at, hosted_by, start_ts, content_type, builds_link)
+            VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (guild_id, channel_id, title, roles_text, after_text, STATUS_OPEN,
+             created_by, int(time.time()), hosted_by, start_ts, content_type, builds_link)
+        )
+        await DB.commit()
+        return cur.lastrowid
 
+async def db_payout_content_once(
+    guild_id: int, content_id: int, user_ids: List[int],
+    amount: int, actor_id: int, force: bool = False,
+) -> Tuple[int, int]:
+    """Выплата за контент. force=False → пропускает уже оплаченных (анти-дабл). Возвращает (paid, skipped)."""
+    now = int(time.time())
+    paid = skipped = 0
+    async with DB_WLOCK:
+        await DB.execute("BEGIN IMMEDIATE")
+        try:
+            for uid in user_ids:
+                if not force:
+                    cur = await DB.execute(
+                        "SELECT 1 FROM content_payouts WHERE guild_id=? AND content_id=? AND user_id=?",
+                        (guild_id, content_id, uid))
+                    if await cur.fetchone():
+                        skipped += 1; continue
+                await _balance_apply_tx(guild_id, uid, amount, "payout_content",
+                                        f"content:{content_id}", actor_id, now)
+                await DB.execute(
+                    """INSERT INTO content_payouts (guild_id, content_id, user_id, amount, paid_at)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(guild_id, content_id, user_id)
+                       DO UPDATE SET amount = amount + excluded.amount, paid_at = excluded.paid_at""",
+                    (guild_id, content_id, uid, amount, now))
+                paid += 1
+            await DB.commit()
+        except Exception:
+            await DB.rollback(); raise
+    return paid, skipped
 
 async def db_set_message_thread(content_id: int, message_id: int, thread_id: Optional[int], photo_url: Optional[str]) -> None:
-    await DB.execute(
-        "UPDATE contents SET message_id = ?, thread_id = ?, photo_url = ? WHERE id = ?",
-        (message_id, thread_id, photo_url, content_id)
-    )
-    await DB.commit()
+    async with DB_WLOCK:
+        await DB.execute(
+            "UPDATE contents SET message_id = ?, thread_id = ?, photo_url = ? WHERE id = ?",
+            (message_id, thread_id, photo_url, content_id)
+        )
+        await DB.commit()
 
 
 async def db_get_content_by_id(content_id: int):
@@ -278,16 +321,18 @@ async def db_get_content_by_thread(thread_id: int):
 
 
 async def db_close_content(content_id: int) -> None:
-    await DB.execute("UPDATE contents SET status = ? WHERE id = ?", (STATUS_CLOSED, content_id))
-    await DB.commit()
+    async with DB_WLOCK:
+        await DB.execute("UPDATE contents SET status = ? WHERE id = ?", (STATUS_CLOSED, content_id))
+        await DB.commit()
 
 
 async def db_set_payout_role(content_id: int, role_id: int, role_name: str) -> None:
-    await DB.execute(
-        "UPDATE contents SET payout_role_id = ?, payout_role_name = ? WHERE id = ?",
-        (role_id, role_name, content_id)
-    )
-    await DB.commit()
+    async with DB_WLOCK:
+        await DB.execute(
+            "UPDATE contents SET payout_role_id = ?, payout_role_name = ? WHERE id = ?",
+            (role_id, role_name, content_id)
+        )
+        await DB.commit()
 
 
 # ---------- slots ----------
@@ -324,29 +369,31 @@ async def db_assign_user(content_id: int, user_id: int, role_index: int) -> Tupl
 
 
 async def db_unassign_user(content_id: int, user_id: int) -> bool:
-    cur = await DB.execute(
-        "DELETE FROM content_assignments WHERE content_id = ? AND user_id = ?",
-        (content_id, user_id)
-    )
-    await DB.commit()
-    return cur.rowcount > 0
+    async with DB_WLOCK:
+        cur = await DB.execute(
+            "DELETE FROM content_assignments WHERE content_id = ? AND user_id = ?",
+            (content_id, user_id)
+        )
+        await DB.commit()
+        return cur.rowcount > 0
 
 
 async def db_unassign_by_role_index(content_id: int, role_index: int) -> Optional[int]:
-    cur = await DB.execute(
-        "SELECT user_id FROM content_assignments WHERE content_id = ? AND role_index = ?",
-        (content_id, role_index)
-    )
-    row = await cur.fetchone()
-    if row is None:
-        return None
-    user_id = int(row[0])
-    await DB.execute(
-        "DELETE FROM content_assignments WHERE content_id = ? AND role_index = ?",
-        (content_id, role_index)
-    )
-    await DB.commit()
-    return user_id
+    async with DB_WLOCK:
+        cur = await DB.execute(
+            "SELECT user_id FROM content_assignments WHERE content_id = ? AND role_index = ?",
+            (content_id, role_index)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        user_id = int(row[0])
+        await DB.execute(
+            "DELETE FROM content_assignments WHERE content_id = ? AND role_index = ?",
+            (content_id, role_index)
+        )
+        await DB.commit()
+        return user_id
 
 
 async def db_get_roster(content_id: int) -> List[Tuple[int, int]]:
@@ -363,31 +410,35 @@ async def db_attend_add_many(content_id: int, user_ids: List[int], added_by: int
                              label: Optional[str] = None) -> Tuple[int, int]:
     added = already = 0
     now = int(time.time())
-    for uid in user_ids:
+    async with DB_WLOCK:
+        await DB.execute("BEGIN IMMEDIATE")
         try:
-            await DB.execute(
-                "INSERT INTO content_attendance (content_id, user_id, added_by, added_at, label) VALUES (?, ?, ?, ?, ?)",
-                (content_id, uid, added_by, now, label)
-            )
-            added += 1
-        except aiosqlite.IntegrityError:
-            already += 1
-            if label is not None:  # перезаписали метку, если уже был в доп
-                await DB.execute(
-                    "UPDATE content_attendance SET label = ? WHERE content_id = ? AND user_id = ?",
-                    (label, content_id, uid)
-                )
-    await DB.commit()
+            for uid in user_ids:
+                try:
+                    await DB.execute(
+                        "INSERT INTO content_attendance (content_id, user_id, added_by, added_at, label) VALUES (?, ?, ?, ?, ?)",
+                        (content_id, uid, added_by, now, label))
+                    added += 1
+                except aiosqlite.IntegrityError:  # дубль не рвёт транзакцию в sqlite
+                    already += 1
+                    if label is not None:
+                        await DB.execute(
+                            "UPDATE content_attendance SET label = ? WHERE content_id = ? AND user_id = ?",
+                            (label, content_id, uid))
+            await DB.commit()
+        except Exception:
+            await DB.rollback(); raise
     return added, already
 
 
 async def db_attend_remove(content_id: int, user_id: int) -> bool:
-    cur = await DB.execute(
-        "DELETE FROM content_attendance WHERE content_id = ? AND user_id = ?",
-        (content_id, user_id)
-    )
-    await DB.commit()
-    return cur.rowcount > 0
+    async with DB_WLOCK:
+        cur = await DB.execute(
+            "DELETE FROM content_attendance WHERE content_id = ? AND user_id = ?",
+            (content_id, user_id)
+        )
+        await DB.commit()
+        return cur.rowcount > 0
 
 
 async def db_attend_list(content_id: int) -> List[int]:
@@ -462,19 +513,17 @@ async def db_att_award_for_content(
 
 async def db_att_remove_for_content(guild_id: int, content_id: int, user_id: int, removed_by: int) -> Tuple[bool, str]:
     now = int(time.time())
-    cur = await DB.execute(
-        "DELETE FROM attendance_awards WHERE guild_id = ? AND content_id = ? AND user_id = ?",
-        (guild_id, content_id, user_id)
-    )
-    if cur.rowcount == 0:
-        await DB.rollback()
-        return False, "У пользователя нет аттенданса за этот контент."
-    await DB.execute(
-        "INSERT INTO attendance_events (guild_id, user_id, content_id, delta, kind, actor_id, created_at) VALUES (?, ?, ?, -1, 'content_remove', ?, ?)",
-        (guild_id, user_id, content_id, removed_by, now)
-    )
-    await DB.commit()
-    return True, "Аттенданс удалён."
+    async with DB_WLOCK:
+        cur = await DB.execute(
+            "DELETE FROM attendance_awards WHERE guild_id = ? AND content_id = ? AND user_id = ?",
+            (guild_id, content_id, user_id))
+        if cur.rowcount == 0:
+            return False, "У пользователя нет аттенданса за этот контент."
+        await DB.execute(
+            "INSERT INTO attendance_events (guild_id, user_id, content_id, delta, kind, actor_id, created_at) VALUES (?, ?, ?, -1, 'content_remove', ?, ?)",
+            (guild_id, user_id, content_id, removed_by, now))
+        await DB.commit()
+        return True, "Аттенданс удалён."
 
 
 async def db_get_joined_at(guild_id: int, user_id: int) -> Optional[int]:
@@ -729,34 +778,28 @@ def build_main_post_embed(content_row, roster, attendance_only) -> discord.Embed
 
     by_index = {idx: uid for idx, uid in roster}
     participants_count = len({uid for _, uid in roster}) + len(attendance_only)
+    is_open = status == STATUS_OPEN
 
-    color = COLOR_GREEN if status == STATUS_OPEN else COLOR_RED
-    embed = discord.Embed(title=f"📋 Контент #{content_id}: {title}", color=color)
-
+    embed = discord.Embed(title=f"📋 Контент #{content_id}: {title}",
+                          color=COLOR_GREEN if is_open else COLOR_RED)
     embed.add_field(name="Тип", value=type_label(content_type), inline=True)
 
     if start_ts and start_ts > 0:
         utc_str = datetime.datetime.fromtimestamp(start_ts, tz=datetime.timezone.utc).strftime("%H:%M UTC")
-        embed.add_field(
-            name="⏰ Be ready by",
-            value=f"{utc_str} • {ts_discord(start_ts, 'F')} • {ts_discord(start_ts, 'R')}",
-            inline=False
-        )
-
+        embed.add_field(name="⏰ Be ready by",
+                        value=f"{utc_str} • {ts_discord(start_ts, 'F')} • {ts_discord(start_ts, 'R')}",
+                        inline=False)
     if hosted_by:
         embed.add_field(name="👤 Content hosted by", value=hosted_by, inline=False)
 
-    status_str = "🟢 Open" if status == STATUS_OPEN else "🔴 Closed"
-    embed.add_field(name="Status", value=status_str, inline=True)
+    embed.add_field(name="Status", value="🟢 Open" if is_open else "🔴 Closed", inline=True)
     embed.add_field(name="Players", value=f"**{participants_count}**", inline=True)
-    embed.add_field(name="Content ID", value=f"`{content_id}`", inline=True)
 
-    # Роли (чанками по лимиту embed-поля).
-    roles_fmt = []
-    for i, role_name in enumerate(roles_lines, start=1):
-        uid = by_index.get(i)
-        roles_fmt.append(f"`{i}.` {role_name} — <@{uid}>" if uid else f"`{i}.` {role_name} —")
-
+    # Роли (чанками)
+    roles_fmt = [
+        f"`{i}.` {rn} — <@{by_index[i]}>" if by_index.get(i) else f"`{i}.` {rn} —"
+        for i, rn in enumerate(roles_lines, start=1)
+    ]
     chunk, chunk_size, field_num = [], 0, 0
     for line in roles_fmt:
         if chunk_size + len(line) + 1 > 950 and chunk:
@@ -768,26 +811,23 @@ def build_main_post_embed(content_row, roster, attendance_only) -> discord.Embed
 
     if attendance_only:
         start = len(roles_lines) + 1
-        att_lines = []
-        for j, (uid, lbl) in enumerate(attendance_only, start=start):
-            att_lines.append(f"`{j}.` {lbl} — <@{uid}>" if lbl else f"`{j}.` <@{uid}>")
+        att_lines = [f"`{j}.` {lbl} — <@{uid}>" if lbl else f"`{j}.` <@{uid}>"
+                     for j, (uid, lbl) in enumerate(attendance_only, start=start)]
         embed.add_field(name="➕ Additionally", value="\n".join(att_lines[:20]), inline=False)
 
     if builds_link:
         embed.add_field(name="🔗 Билды", value=builds_link, inline=False)
-
     if after_text and after_text.strip():
         embed.add_field(name="📌 Note", value=after_text.strip(), inline=False)
 
-    embed.add_field(
-        name="📖 В ветке",
-        value="➣ `1` — занять роль (если свободна)\n➣ `-` — выписаться с роли",
-        inline=False
-    )
+    # закрыт → не показываем инструкцию записи, показываем замок (меньше шума + п.1)
+    if is_open:
+        embed.add_field(name="📖 В ветке", value="`1` — занять роль · `-` — выписаться", inline=False)
+    else:
+        embed.add_field(name="🔒 Запись закрыта", value="Самозапись недоступна.", inline=False)
 
     if photo_url:
         embed.set_image(url=photo_url)
-
     return embed
 
 
@@ -803,7 +843,8 @@ async def refresh_main_post(guild: discord.Guild, content_row) -> None:
         attendance_only = [(uid, lbl) for uid, lbl in attend if uid not in roster_uids]
         embed = build_main_post_embed(content_row, roster, attendance_only)
         # attachments не трогаем => фото (аттач этого же сообщения) остаётся валидным.
-        await msg.edit(content=None, embed=embed)
+        await msg.edit(content="@everyone", embed=embed,
+                       allowed_mentions=discord.AllowedMentions(everyone=False))
     except Exception as e:
         print(f"[refresh_main_post] content={content_row['id']}: {e!r}")
         return
@@ -1053,7 +1094,37 @@ intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 bot = commands.Bot(command_prefix=commands.when_mentioned_or("!"), intents=intents)
+bot.remove_command("help")
 
+def build_help_embed() -> discord.Embed:
+    e = discord.Embed(title="📖 Команды бота", color=COLOR_BLUE)
+    e.add_field(name="👥 Для всех", inline=False, value=(
+        "`/balance` · `!bal [@user]` — баланс\n"
+        "`/att_profile` · `!att [@user]` — посещаемость\n"
+        "`/att_stats` · `!lb` — лидерборд месяца\n"
+        "`/help` · `!help` — это меню · `/healthcheck` — статус"))
+    e.add_field(name="🧵 В ветке", inline=False, value="`<цифра>` — занять роль · `-` — выписаться")
+    e.add_field(name="🛡️ Стафф / Орг", inline=False, value=(
+        "`/content_create` · `/content_close <id>`\n"
+        "`/content_copy <id>` · `!copy <id>` — скопировать кол\n"
+        "`/add_ppl` · `/att_add <id>` · `/att_remove <id> @user` · `/att_export_csv`\n"
+        "`/role_from_content <id>` · `/role_from_screenshot` · `/role_clear <id>`"))
+    e.add_field(name="💰 Деньги (стафф)", inline=False, value=(
+        "`/money_add` · `!add-money @user сумма`\n"
+        "`/money_sub` · `!remove-money @user сумма`\n"
+        "`/money_payout_role` · `!add-money-role @role сумма`\n"
+        "`/money_payout_content <id> сумма [force]` · `!economy-stats`"))
+    e.add_field(name="🧵 В ветке (стафф)", inline=False, value=(
+        "`+хилл @user` · `+2 @user` · `-2` · `- @user` · `+ @user...`"))
+    return e
+
+@bot.tree.command(name="help", description="Список всех команд бота")
+async def help_slash(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=build_help_embed(), ephemeral=True)
+
+@bot.command(name="help")
+async def help_prefix(ctx: commands.Context):
+    await ctx.reply(embed=build_help_embed(), mention_author=False)
 
 @bot.event
 async def on_ready():
@@ -1123,7 +1194,8 @@ class ContentCreateModal(discord.ui.Modal, title="Создать контент"
 
         # Шлём пост сразу с фото (аттач этого сообщения => URL не протухает при edit).
         photo_url = None
-        send_kwargs = {"content": f"**Контент #{content_id}: {title}**\nСоздание…"}
+        send_kwargs = {"content": "@everyone",
+                       "allowed_mentions": discord.AllowedMentions(everyone=True)}
         if self.photo is not None:
             try:
                 send_kwargs["file"] = await self.photo.to_file()
@@ -1294,21 +1366,20 @@ async def on_message(message: discord.Message):
         ), mention_author=False)
         return
 
-    if status != STATUS_OPEN and not is_org:
-        await _try_delete_command(message)                 # убираем команду
-        try:
-            await message.channel.send("🔒 Запись закрыта.", delete_after=5)  # всплывающее, само удалится
-        except Exception:
-            pass
-        return
-
     roles_lines = normalize_roles_lines(str(content["roles_text"]))
     max_slot = len(roles_lines)
 
+    # Самозапись — только когда открыт, для всех (вкл. орга: орг ставит через +N)
     if kind == "self_join":
-        if num is None or num < 1 or num > max_slot:
-            await message.reply(f"Неверный номер. Допустимо: 1..{max_slot}", mention_author=False)
+        if status != STATUS_OPEN:
+            await _try_delete_command(message)
+            try:
+                await message.channel.send("🔒 Запись закрыта.", delete_after=5)
+            except Exception:
+                pass
             return
+        if num is None or num < 1 or num > max_slot:
+            await message.reply(f"Неверный номер. Допустимо: 1..{max_slot}", mention_author=False); return
         ok, txt = await db_assign_user(content_id, message.author.id, int(num))
         await message.add_reaction("✅" if ok else "⛔")
         if not ok:
@@ -1319,9 +1390,12 @@ async def on_message(message: discord.Message):
         await _try_delete_command(message)
         return
 
+    # Дальше — только управляющие команды организатора (работают и при закрытом)
+    if not is_org:
+        await _try_delete_command(message)
+        return
+
     if kind == "org_attend_add":
-        if not is_org:
-            await message.reply("Недостаточно прав.", mention_author=False); return
         user_ids = [m.id for m in message.mentions]
         if not user_ids:
             await message.reply("Формат: `+ @user @user ...`", mention_author=False); return
@@ -1335,8 +1409,6 @@ async def on_message(message: discord.Message):
         return
 
     if kind == "org_assign_slot":
-        if not is_org:
-            await message.reply("Недостаточно прав.", mention_author=False); return
         if num is None or num < 1 or num > max_slot:
             await message.reply(f"Неверный номер. Допустимо: 1..{max_slot}", mention_author=False); return
         if not message.mentions:
@@ -1351,8 +1423,6 @@ async def on_message(message: discord.Message):
         return
 
     if kind == "org_assign_label":
-        if not is_org:
-            await message.reply("Недостаточно прав.", mention_author=False); return
         if not message.mentions:
             await message.reply("Формат: `+хилл @user`", mention_author=False); return
         label_match = re.match(r"^\+(.+?)\s+<@", cmd)
@@ -1369,8 +1439,6 @@ async def on_message(message: discord.Message):
         return
 
     if kind == "org_kick_role":
-        if not is_org:
-            await message.reply("Недостаточно прав.", mention_author=False); return
         if num is None or num < 1 or num > max_slot:
             await message.reply(f"Неверный номер. Допустимо: 1..{max_slot}", mention_author=False); return
         kicked = await db_unassign_by_role_index(content_id, int(num))
@@ -1382,8 +1450,6 @@ async def on_message(message: discord.Message):
         return
 
     if kind == "org_kick_user":
-        if not is_org:
-            await message.reply("Недостаточно прав.", mention_author=False); return
         if not message.mentions:
             await message.reply("Формат: `- @user`", mention_author=False); return
         target = message.mentions[0]
@@ -1836,8 +1902,10 @@ async def money_payout_role(interaction: discord.Interaction, role: discord.Role
 
 
 @bot.tree.command(name="money_payout_content", description="Начислить деньги всем участникам контента (стафф)")
-@app_commands.describe(content_id="ID контента", amount="Сколько каждому (>0)", reason="Причина (опционально)")
-async def money_payout_content(interaction: discord.Interaction, content_id: int, amount: int, reason: Optional[str] = None):
+@app_commands.describe(content_id="ID контента", amount="Сколько каждому (>0)",
+                       reason="Причина (опц.)", force="Повторно выплатить уже оплаченным")
+async def money_payout_content(interaction: discord.Interaction, content_id: int, amount: int,
+                               reason: Optional[str] = None, force: bool = False):
     await interaction.response.defer(ephemeral=False)
     row = await db_get_content_by_id(content_id)
     if row is None:
@@ -1850,10 +1918,12 @@ async def money_payout_content(interaction: discord.Interaction, content_id: int
     user_ids = await db_get_all_participants(content_id)
     if not user_ids:
         await interaction.followup.send("Нет участников.", ephemeral=True); return
-    await db_balance_payout_many(int(interaction.guild_id), [int(u) for u in user_ids], amount,
-                                 "payout_content", reason or f"content:{content_id}", int(interaction.user.id))
+    paid, skipped = await db_payout_content_once(
+        int(interaction.guild_id), int(content_id), [int(u) for u in user_ids],
+        amount, int(interaction.user.id), force=force)
     embed = discord.Embed(title="✅ Выплата за контент", color=COLOR_GREEN,
-                          description=f"Контент **#{content_id}**: +{fmt_money(amount)} каждому\nПолучателей: **{len(user_ids)}**")
+        description=f"Контент **#{content_id}**: +{fmt_money(amount)} каждому\n"
+                    f"Выплачено: **{paid}** · Пропущено (уже было): **{skipped}**")
     if reason:
         embed.add_field(name="Причина", value=reason, inline=False)
     await interaction.followup.send(embed=embed)
@@ -1868,7 +1938,7 @@ async def money_payout_content(interaction: discord.Interaction, content_id: int
     app_commands.Choice(name="Полное (с тегами участников)", value="full"),
     app_commands.Choice(name="Упрощённое (структура без людей)", value="simple"),
 ])
-async def content_copy(interaction: discord.Interaction, content_id: int, mode: str = "simple"):
+async def content_copy(interaction: discord.Interaction, content_id: int, mode: str = "full"):
     await interaction.response.defer(ephemeral=True)
     row = await db_get_content_by_id(content_id)
     if row is None:
@@ -1880,55 +1950,53 @@ async def content_copy(interaction: discord.Interaction, content_id: int, mode: 
     title = str(row["title"])
     roles_lines = normalize_roles_lines(str(row["roles_text"]))
     start_ts = int(row["start_ts"]) if row["start_ts"] else None
-    after_text = str(row["after_text"]).strip() if row["after_text"] else None
-    builds_link = str(row["builds_link"]) if row["builds_link"] else None
-    content_type = str(row["content_type"])
+
+    lines = [f"**{title}**"]
+    if start_ts:
+        utc_str = datetime.datetime.fromtimestamp(start_ts, tz=datetime.timezone.utc).strftime("%H:%M UTC")
+        lines.append(f"⏰ {utc_str} • {ts_discord(start_ts, 'F')}")
+    lines.append("")
 
     if mode == "full":
         roster = await db_get_roster(content_id)
-        attend = await db_attend_list_labeled(content_id)
         by_index = {idx: uid for idx, uid in roster}
-        roster_uids = {uid for _, uid in roster}
-        attendance_only = [(uid, lbl) for uid, lbl in attend if uid not in roster_uids]
-        lines = [f"**Контент: {title}**", f"Тип: {type_label(content_type)}"]
-        if start_ts:
-            utc_str = datetime.datetime.fromtimestamp(start_ts, tz=datetime.timezone.utc).strftime("%H:%M UTC")
-            lines.append(f"\u23f0 Be ready by: {utc_str} ({ts_discord(start_ts, 'F')})")
-        if builds_link:
-            lines.append(f"\U0001f517 Билды: {builds_link}")
-        lines.extend(["", "**\U0001f4dd Роли:**"])
-        for i, role_name in enumerate(roles_lines, start=1):
+        for i, rn in enumerate(roles_lines, start=1):
             uid = by_index.get(i)
-            lines.append(f"`{i}.` {role_name} — <@{uid}>" if uid else f"`{i}.` {role_name} —")
-        if attendance_only:
-            lines.extend(["", "**\u2795 Дополнительно:**"])
-            for uid, lbl in attendance_only:
-                lines.append(f"\u2022 {lbl} — <@{uid}>" if lbl else f"\u2022 <@{uid}>")
-        if after_text:
-            lines.extend(["", f"\U0001f4cc {after_text}"])
+            lines.append(f"`{i}.` {rn} — <@{uid}>" if uid else f"`{i}.` {rn} —")
     else:
-        lines = [f"**Контент: {title}**", f"Тип: {type_label(content_type)}"]
-        if start_ts:
-            utc_str = datetime.datetime.fromtimestamp(start_ts, tz=datetime.timezone.utc).strftime("%H:%M UTC")
-            lines.append(f"\u23f0 Be ready by: {utc_str} ({ts_discord(start_ts, 'F')})")
-        if builds_link:
-            lines.append(f"\U0001f517 Билды: {builds_link}")
-        lines.extend(["", "**\U0001f4dd Роли:**"])
-        for i, role_name in enumerate(roles_lines, start=1):
-            lines.append(f"`{i}.` {role_name}")
-        if after_text:
-            lines.extend(["", f"\U0001f4cc {after_text}"])
+        for i, rn in enumerate(roles_lines, start=1):
+            lines.append(f"`{i}.` {rn}")
 
     text = "\n".join(lines)
     if len(text) <= 1900:
         await interaction.followup.send(content=text, ephemeral=True)
     else:
         buf = io.BytesIO(text.encode("utf-8"))
-        file = discord.File(buf, filename=f"content_{content_id}_copy.txt")
-        await interaction.followup.send(
-            content=f"Копия контента **#{content_id}**:",
-            file=file, ephemeral=True
-        )
+        await interaction.followup.send(content=f"Копия контента **#{content_id}**:",
+                                        file=discord.File(buf, filename=f"content_{content_id}.txt"),
+                                        ephemeral=True)
+        
+@bot.command(name="copy")
+async def prefix_copy(ctx: commands.Context, content_id: int, mode: str = "full"):
+    """!copy <id> [full|simple] — скопировать кол для вставки."""
+    if ctx.guild is None: return
+    if not (isinstance(ctx.author, discord.Member) and member_is_staff(ctx.author)):
+        await ctx.reply("\u274c Только стафф.", mention_author=False); return
+    row = await db_get_content_by_id(content_id)
+    if row is None:
+        await ctx.reply("Контент не найден.", mention_author=False); return
+    roles_lines = normalize_roles_lines(str(row["roles_text"]))
+    start_ts = int(row["start_ts"]) if row["start_ts"] else None
+    lines = [f"**{row['title']}**"]
+    if start_ts:
+        utc_str = datetime.datetime.fromtimestamp(start_ts, tz=datetime.timezone.utc).strftime("%H:%M UTC")
+        lines.append(f"⏰ {utc_str} • {ts_discord(start_ts, 'F')}")
+    lines.append("")
+    by_index = {idx: uid for idx, uid in await db_get_roster(content_id)} if mode == "full" else {}
+    for i, rn in enumerate(roles_lines, start=1):
+        uid = by_index.get(i)
+        lines.append(f"`{i}.` {rn} — <@{uid}>" if uid else f"`{i}.` {rn} —")
+    await ctx.reply("\n".join(lines)[:1990], mention_author=False)
 
 
 # =========================
