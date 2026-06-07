@@ -686,6 +686,29 @@ async def db_balance_payout_many(
             await DB.rollback()
             raise
 
+async def db_balance_leaderboard(guild_id: int, limit: int = 200) -> List[Tuple[int, int]]:
+    """Топ по текущему балансу (только > 0)."""
+    cur = await DB.execute(
+        """SELECT user_id, amount FROM balances
+           WHERE guild_id = ? AND amount > 0
+           ORDER BY amount DESC, user_id ASC LIMIT ?""",
+        (guild_id, limit))
+    return [(int(r[0]), int(r[1])) for r in await cur.fetchall()]
+
+
+async def db_balance_events_since(guild_id: int, since_ts: int) -> List[dict]:
+    """Все транзакции с момента since_ts (для CSV-выгрузки)."""
+    cur = await DB.execute(
+        """SELECT created_at, user_id, delta, balance_after, kind, reason, actor_id
+           FROM balance_events
+           WHERE guild_id = ? AND created_at >= ?
+           ORDER BY created_at ASC""",
+        (guild_id, since_ts))
+    rows = await cur.fetchall()
+    return [{"created_at": int(r[0]), "user_id": int(r[1]), "delta": int(r[2]),
+             "balance_after": int(r[3]), "kind": str(r[4]),
+             "reason": (str(r[5]) if r[5] else ""), "actor_id": int(r[6])} for r in rows]
+
 
 # =========================
 # HELPERS
@@ -926,12 +949,13 @@ def match_members(guild: discord.Guild, tokens: List[str]) -> Tuple[List[Tuple[s
 # LEADERBOARD VIEW
 # =========================
 class LeaderboardView(discord.ui.View):
-    def __init__(self, rows, guild, requester_id, my_count):
+    def __init__(self, rows, guild, requester_id, my_count, money: bool = False):
         super().__init__(timeout=300)
         self.rows = rows
         self.guild = guild
         self.requester_id = requester_id
         self.my_count = my_count
+        self.money = money
         self.page = 0
         self.total_pages = max(1, (len(rows) + LEADERBOARD_PAGE_SIZE - 1) // LEADERBOARD_PAGE_SIZE)
         self._update_buttons()
@@ -942,23 +966,24 @@ class LeaderboardView(discord.ui.View):
         self.page_label.label = f"{self.page + 1} / {self.total_pages}"
 
     def build_embed(self) -> discord.Embed:
-        embed = discord.Embed(
-            title="🏆 Лидерборд посещаемости (текущий месяц)",
-            color=COLOR_GOLD
-        )
+        title = "💰 Лидерборд по балансу" if self.money else "🏆 Лидерборд посещаемости (текущий месяц)"
+        embed = discord.Embed(title=title, color=COLOR_GOLD)
         start_idx = self.page * LEADERBOARD_PAGE_SIZE
         page_rows = self.rows[start_idx:start_idx + LEADERBOARD_PAGE_SIZE]
         if not page_rows:
             embed.description = "_Пока пусто_"
         else:
             lines = []
-            for i, (uid, cnt) in enumerate(page_rows, start=start_idx + 1):
+            for i, (uid, val) in enumerate(page_rows, start=start_idx + 1):
                 medal = MEDALS.get(i, "🎖️" if i <= 10 else "▫️")
                 member = self.guild.get_member(uid)
                 name = member.display_name if member else f"<@{uid}>"
-                lines.append(f"{medal} **{i}.** {name} **·** {cnt}")
+                val_str = fmt_money(val) if self.money else str(val)
+                lines.append(f"{medal} **{i}.** {name} **·** {val_str}")
             embed.description = "\n".join(lines)
-        embed.set_footer(text=f"Ваш результат за месяц: {self.my_count}  •  Стр. {self.page + 1}/{self.total_pages}")
+        my_str = fmt_money(self.my_count) if self.money else f"{self.my_count}"
+        suffix = "Ваш баланс" if self.money else "Ваш результат за месяц"
+        embed.set_footer(text=f"{suffix}: {my_str}  •  Стр. {self.page + 1}/{self.total_pages}")
         return embed
 
     @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
@@ -1102,6 +1127,7 @@ def build_help_embed() -> discord.Embed:
         "`/balance` · `!bal [@user]` — баланс\n"
         "`/att_profile` · `!att [@user]` — посещаемость\n"
         "`/att_stats` · `!lb` — лидерборд месяца\n"
+        "`/economy_lb` · `!economy-lb` — топ по балансу\n"
         "`/help` · `!help` — это меню · `/healthcheck` — статус"))
     e.add_field(name="🧵 В ветке", inline=False, value="`<цифра>` — занять роль · `-` — выписаться")
     e.add_field(name="🛡️ Стафф / Орг", inline=False, value=(
@@ -1113,7 +1139,8 @@ def build_help_embed() -> discord.Embed:
         "`/money_add` · `!add-money @user сумма`\n"
         "`/money_sub` · `!remove-money @user сумма`\n"
         "`/money_payout_role` · `!add-money-role @role сумма`\n"
-        "`/money_payout_content <id> сумма [force]` · `!economy-stats`"))
+        "`/money_payout_content <id> сумма [force]` · `!economy-stats`\n"
+        "`/economy_export_csv [days]` — выгрузка транзакций"))
     e.add_field(name="🧵 В ветке (стафф)", inline=False, value=(
         "`+хилл @user` · `+2 @user` · `-2` · `- @user` · `+ @user...`"))
     return e
@@ -2149,6 +2176,64 @@ async def prefix_economy_stats(ctx: commands.Context):
     )
     await ctx.reply(embed=embed, mention_author=False)
 
+@bot.command(name="economy-lb")
+async def prefix_economy_lb(ctx: commands.Context):
+    """!economy-lb — лидерборд по балансам (для всех)."""
+    if ctx.guild is None: return
+    rows = await db_balance_leaderboard(ctx.guild.id)
+    my_bal = await db_balance_get(ctx.guild.id, ctx.author.id)
+    view = LeaderboardView(rows=rows, guild=ctx.guild, requester_id=ctx.author.id, my_count=my_bal, money=True)
+    await ctx.reply(embed=view.build_embed(), view=view, mention_author=False)
+
+
+@bot.tree.command(name="economy_lb", description="Лидерборд по балансам")
+async def economy_lb(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    if interaction.guild is None or interaction.guild_id is None:
+        await interaction.followup.send("Guild недоступен."); return
+    rows = await db_balance_leaderboard(int(interaction.guild_id))
+    my_bal = await db_balance_get(int(interaction.guild_id), int(interaction.user.id))
+    view = LeaderboardView(rows=rows, guild=interaction.guild, requester_id=interaction.user.id, my_count=my_bal, money=True)
+    await interaction.followup.send(embed=view.build_embed(), view=view)
+
+
+@bot.tree.command(name="economy_export_csv", description="Выгрузить транзакции экономики в CSV (стафф)")
+@app_commands.describe(days="За сколько последних дней (по умолчанию 30)")
+async def economy_export_csv(interaction: discord.Interaction, days: int = 30):
+    await interaction.response.defer(ephemeral=True)
+    if interaction.guild is None or interaction.guild_id is None:
+        await interaction.followup.send("Guild недоступен.", ephemeral=True); return
+    member = interaction.guild.get_member(interaction.user.id)
+    if member is None or not member_is_staff(member):
+        await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
+    if days <= 0:
+        days = 30
+    since = int(time.time()) - days * 86400
+    events = await db_balance_events_since(int(interaction.guild_id), since)
+    if not events:
+        await interaction.followup.send(f"Нет транзакций за последние {days} дн.", ephemeral=True); return
+
+    def name_of(uid: int) -> str:
+        gm = interaction.guild.get_member(uid)
+        return gm.display_name if gm else f"ID:{uid}"
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Дата (UTC)", "User ID", "Пользователь", "Дельта", "Баланс после",
+                     "Тип", "Причина", "Кто начислил ID", "Кто начислил"])
+    for e in events:
+        writer.writerow([
+            datetime.datetime.fromtimestamp(e["created_at"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            e["user_id"], name_of(e["user_id"]), e["delta"], e["balance_after"],
+            e["kind"], e["reason"], e["actor_id"], name_of(e["actor_id"]),
+        ])
+    output.seek(0)
+    csv_bytes = output.getvalue().encode("utf-8-sig")
+    file = discord.File(fp=io.BytesIO(csv_bytes), filename=f"economy_{days}d_{int(time.time())}.csv")
+    embed = discord.Embed(title="📥 Выгрузка экономики",
+                          description=f"Транзакций за последние **{days}** дн.: **{len(events)}**",
+                          color=COLOR_BLUE)
+    await interaction.followup.send(embed=embed, file=file, ephemeral=True)
 
 # =========================
 # MAIN
