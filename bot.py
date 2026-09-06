@@ -4,8 +4,9 @@ import io
 import csv
 import time
 import asyncio
+import logging
 import datetime
-from typing import Optional, List, Tuple, Set
+from typing import Optional, List, Tuple, Set, Dict
 
 import discord
 from discord import app_commands
@@ -13,22 +14,15 @@ from discord.ext import commands
 import aiosqlite
 from dotenv import load_dotenv
 
-# OCR / fuzzy match (для /role_from_screenshot)
-# Требует системный бинарь tesseract: apt install tesseract-ocr tesseract-ocr-rus
-# pip: pillow pytesseract rapidfuzz
-try:
-    from PIL import Image, ImageOps
-    import pytesseract
-    from rapidfuzz import process as rf_process, fuzz as rf_fuzz
-    OCR_AVAILABLE = True
-except Exception:
-    OCR_AVAILABLE = False
+log = logging.getLogger("candybot")
 
 # =========================
 # CONFIG
 # =========================
 load_dotenv()
-DB_PATH = "cs_helper.db"
+DB_PATH = os.getenv("DB_PATH", "cs_helper.db")
+_GUILD_RAW = os.getenv("GUILD_ID", "").strip()
+GUILD_ID = int(_GUILD_RAW) if _GUILD_RAW.isdigit() else 0
 
 STATUS_OPEN = "open"
 STATUS_CLOSED = "closed"
@@ -37,7 +31,6 @@ TYPE_MANDATORY = "mandatory"
 TYPE_OPTIONAL = "optional"
 
 LEADERBOARD_PAGE_SIZE = 20
-FUZZ_CUTOFF = 78  # порог совпадения ника при OCR
 
 CURRENCY = "💰"  # символ валюты — поменять тут
 
@@ -47,7 +40,7 @@ STAFF_ROLE_IDS: Set[int] = {
     int(x) for x in os.getenv("STAFF_ROLE_IDS", "").replace(" ", "").split(",") if x.isdigit()
 }
 
-# RL роли — могут /content_create. .env: RL_ROLE_IDS=111,222
+# RL роли — обязательный /content_create. .env: RL_ROLE_IDS=111,222
 RL_ROLE_IDS: Set[int] = {
     int(x) for x in os.getenv("RL_ROLE_IDS", "").replace(" ", "").split(",") if x.isdigit()
 }
@@ -63,7 +56,6 @@ COLOR_BLUE   = 0x5865F2
 COLOR_GREEN  = 0x57F287
 COLOR_RED    = 0xED4245
 COLOR_YELLOW = 0xFEE75C
-COLOR_PURPLE = 0x9B59B6
 COLOR_GOLD   = 0xF1C40F
 
 # Глобальный коннект к БД (инициализируется в db_init).
@@ -78,6 +70,8 @@ DB_WLOCK = asyncio.Lock()  # сериализует write-транзакции �
 # =========================
 async def db_init() -> None:
     global DB
+    if DB is not None:
+        return
     DB = await aiosqlite.connect(DB_PATH)
     DB.row_factory = aiosqlite.Row
     await DB.execute("PRAGMA journal_mode=WAL")
@@ -201,6 +195,37 @@ async def db_init() -> None:
     );
     """)
 
+    # Siphoned Energy: уникальность строки лога (дата+ник+reason+сумма),
+    # пересекающиеся выгрузки не дублируют проводки.
+    await DB.execute("""
+    CREATE TABLE IF NOT EXISTS siphon_events (
+        guild_id INTEGER NOT NULL,
+        occurred_at INTEGER NOT NULL,
+        occurred_at_raw TEXT NOT NULL,
+        player_key TEXT NOT NULL,
+        player TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        amount INTEGER NOT NULL,
+        imported_at INTEGER NOT NULL,
+        imported_by INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, occurred_at_raw, player_key, reason, amount)
+    );
+    """)
+    await DB.execute("""
+    CREATE TABLE IF NOT EXISTS siphon_balances (
+        guild_id INTEGER NOT NULL,
+        player_key TEXT NOT NULL,
+        player TEXT NOT NULL,
+        deposited INTEGER NOT NULL DEFAULT 0,
+        withdrawn INTEGER NOT NULL DEFAULT 0,
+        net INTEGER NOT NULL DEFAULT 0,
+        ops INTEGER NOT NULL DEFAULT 0,
+        last_at INTEGER,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, player_key)
+    );
+    """)
+
     # Миграции для старой БД (новые колонки contents).
     migrations = [
         "ALTER TABLE contents ADD COLUMN content_type TEXT NOT NULL DEFAULT 'mandatory'",
@@ -213,13 +238,20 @@ async def db_init() -> None:
     for sql in migrations:
         try:
             await DB.execute(sql)
-        except Exception:
-            pass
+        except aiosqlite.OperationalError as e:
+            msg = str(e).lower()
+            if "duplicate column" in msg or "already exists" in msg:
+                continue
+            raise
 
     await DB.execute("CREATE INDEX IF NOT EXISTS idx_contents_guild_type_start ON contents(guild_id, content_type, start_ts)")
+    await DB.execute("CREATE INDEX IF NOT EXISTS idx_contents_guild_status ON contents(guild_id, status)")
+    await DB.execute("CREATE INDEX IF NOT EXISTS idx_contents_thread ON contents(thread_id)")
     await DB.execute("CREATE INDEX IF NOT EXISTS idx_awards_guild_user ON attendance_awards(guild_id, user_id)")
     await DB.execute("CREATE INDEX IF NOT EXISTS idx_balevents_guild_user ON balance_events(guild_id, user_id)")
     await DB.execute("CREATE INDEX IF NOT EXISTS idx_awards_guild_awarded ON attendance_awards(guild_id, awarded_at)")
+    await DB.execute("CREATE INDEX IF NOT EXISTS idx_siphon_guild_player ON siphon_events(guild_id, player_key, occurred_at)")
+    await DB.execute("CREATE INDEX IF NOT EXISTS idx_siphon_bal_net ON siphon_balances(guild_id, net)")
 
     # Самолечение: joined_at должен = времени первого начисления.
     # Чинит данные, записанные старым кодом (где joined_at ошибочно = start_ts в будущем).
@@ -267,16 +299,21 @@ async def db_create_content(
             (guild_id, channel_id, title, roles_text, after_text, STATUS_OPEN,
              created_by, int(time.time()), hosted_by, start_ts, content_type, builds_link)
         )
+        rid = cur.lastrowid
         await DB.commit()
-        return cur.lastrowid
+        if rid is None:
+            raise RuntimeError("не удалось получить id контента")
+        return int(rid)
 
 async def db_payout_content_once(
     guild_id: int, content_id: int, user_ids: List[int],
     amount: int, actor_id: int, force: bool = False,
+    reason: Optional[str] = None,
 ) -> Tuple[int, int]:
     """Выплата за контент. force=False → пропускает уже оплаченных (анти-дабл). Возвращает (paid, skipped)."""
     now = int(time.time())
     paid = skipped = 0
+    payout_reason = reason or f"content:{content_id}"
     async with DB_WLOCK:
         await DB.execute("BEGIN IMMEDIATE")
         try:
@@ -288,7 +325,7 @@ async def db_payout_content_once(
                     if await cur.fetchone():
                         skipped += 1; continue
                 await _balance_apply_tx(guild_id, uid, amount, "payout_content",
-                                        f"content:{content_id}", actor_id, now)
+                                        payout_reason, actor_id, now)
                 await DB.execute(
                     """INSERT INTO content_payouts (guild_id, content_id, user_id, amount, paid_at)
                        VALUES (?, ?, ?, ?, ?)
@@ -301,38 +338,109 @@ async def db_payout_content_once(
             await DB.rollback(); raise
     return paid, skipped
 
-async def db_set_message_thread(content_id: int, message_id: int, thread_id: Optional[int], photo_url: Optional[str]) -> None:
+async def db_set_message_thread(
+    content_id: int, guild_id: int, message_id: int,
+    thread_id: Optional[int], photo_url: Optional[str],
+) -> None:
     async with DB_WLOCK:
         await DB.execute(
-            "UPDATE contents SET message_id = ?, thread_id = ?, photo_url = ? WHERE id = ?",
-            (message_id, thread_id, photo_url, content_id)
+            """UPDATE contents SET message_id = ?, thread_id = ?, photo_url = ?
+               WHERE id = ? AND guild_id = ?""",
+            (message_id, thread_id, photo_url, content_id, guild_id)
         )
         await DB.commit()
 
 
-async def db_get_content_by_id(content_id: int):
-    cur = await DB.execute("SELECT * FROM contents WHERE id = ?", (content_id,))
-    return await cur.fetchone()
-
-
-async def db_get_content_by_thread(thread_id: int):
-    cur = await DB.execute("SELECT * FROM contents WHERE thread_id = ?", (thread_id,))
-    return await cur.fetchone()
-
-
-async def db_close_content(content_id: int) -> None:
-    async with DB_WLOCK:
-        await DB.execute("UPDATE contents SET status = ? WHERE id = ?", (STATUS_CLOSED, content_id))
-        await DB.commit()
-
-
-async def db_set_payout_role(content_id: int, role_id: int, role_name: str) -> None:
+async def db_set_photo_url(content_id: int, guild_id: int, photo_url: Optional[str]) -> None:
     async with DB_WLOCK:
         await DB.execute(
-            "UPDATE contents SET payout_role_id = ?, payout_role_name = ? WHERE id = ?",
-            (role_id, role_name, content_id)
+            "UPDATE contents SET photo_url = ? WHERE id = ? AND guild_id = ?",
+            (photo_url, content_id, guild_id),
         )
         await DB.commit()
+
+
+async def db_get_content_by_id(content_id: int, guild_id: int):
+    cur = await DB.execute(
+        "SELECT * FROM contents WHERE id = ? AND guild_id = ?",
+        (content_id, guild_id),
+    )
+    return await cur.fetchone()
+
+
+async def db_get_content_by_thread(thread_id: int, guild_id: int):
+    cur = await DB.execute(
+        "SELECT * FROM contents WHERE thread_id = ? AND guild_id = ?",
+        (thread_id, guild_id),
+    )
+    return await cur.fetchone()
+
+
+async def db_close_content(content_id: int, guild_id: int) -> None:
+    async with DB_WLOCK:
+        await DB.execute(
+            "UPDATE contents SET status = ? WHERE id = ? AND guild_id = ?",
+            (STATUS_CLOSED, content_id, guild_id),
+        )
+        await DB.commit()
+
+
+async def db_set_payout_role(content_id: int, guild_id: int, role_id: int, role_name: str) -> None:
+    async with DB_WLOCK:
+        await DB.execute(
+            """UPDATE contents SET payout_role_id = ?, payout_role_name = ?
+               WHERE id = ? AND guild_id = ?""",
+            (role_id, role_name, content_id, guild_id)
+        )
+        await DB.commit()
+
+
+async def db_clear_payout_role(content_id: int, guild_id: int) -> None:
+    async with DB_WLOCK:
+        await DB.execute(
+            "UPDATE contents SET payout_role_id = NULL, payout_role_name = NULL WHERE id = ? AND guild_id = ?",
+            (content_id, guild_id)
+        )
+        await DB.commit()
+
+
+async def db_delete_content(content_id: int, guild_id: int) -> None:
+    """Удаляет контент и связанные слоты/присутствие. Awards/payouts не трогает."""
+    async with DB_WLOCK:
+        await DB.execute("BEGIN IMMEDIATE")
+        try:
+            cur = await DB.execute(
+                "SELECT id FROM contents WHERE id = ? AND guild_id = ?",
+                (content_id, guild_id),
+            )
+            if await cur.fetchone() is None:
+                await DB.rollback()
+                return
+            await DB.execute("DELETE FROM content_assignments WHERE content_id = ?", (content_id,))
+            await DB.execute("DELETE FROM content_attendance WHERE content_id = ?", (content_id,))
+            await DB.execute("DELETE FROM contents WHERE id = ? AND guild_id = ?", (content_id, guild_id))
+            await DB.commit()
+        except Exception:
+            await DB.rollback()
+            raise
+
+
+async def db_list_contents(guild_id: int, status: Optional[str], limit: int = 25):
+    if status in (STATUS_OPEN, STATUS_CLOSED):
+        cur = await DB.execute(
+            """SELECT id, title, status, start_ts, content_type, created_by
+               FROM contents WHERE guild_id = ? AND status = ?
+               ORDER BY id DESC LIMIT ?""",
+            (guild_id, status, limit),
+        )
+    else:
+        cur = await DB.execute(
+            """SELECT id, title, status, start_ts, content_type, created_by
+               FROM contents WHERE guild_id = ?
+               ORDER BY id DESC LIMIT ?""",
+            (guild_id, limit),
+        )
+    return await cur.fetchall()
 
 
 # ---------- slots ----------
@@ -478,7 +586,7 @@ async def db_get_all_participants(content_id: int) -> List[int]:
 # =========================
 async def db_att_award_for_content(
     guild_id: int, content_id: int, user_ids: List[int],
-    awarded_by: int, content_start_ts: Optional[int] = None,
+    awarded_by: int,
 ) -> Tuple[int, int]:
     now = int(time.time())
     awarded = already = 0
@@ -514,16 +622,24 @@ async def db_att_award_for_content(
 async def db_att_remove_for_content(guild_id: int, content_id: int, user_id: int, removed_by: int) -> Tuple[bool, str]:
     now = int(time.time())
     async with DB_WLOCK:
-        cur = await DB.execute(
-            "DELETE FROM attendance_awards WHERE guild_id = ? AND content_id = ? AND user_id = ?",
-            (guild_id, content_id, user_id))
-        if cur.rowcount == 0:
-            return False, "У пользователя нет аттенданса за этот контент."
-        await DB.execute(
-            "INSERT INTO attendance_events (guild_id, user_id, content_id, delta, kind, actor_id, created_at) VALUES (?, ?, ?, -1, 'content_remove', ?, ?)",
-            (guild_id, user_id, content_id, removed_by, now))
-        await DB.commit()
-        return True, "Аттенданс удалён."
+        await DB.execute("BEGIN IMMEDIATE")
+        try:
+            cur = await DB.execute(
+                "DELETE FROM attendance_awards WHERE guild_id = ? AND content_id = ? AND user_id = ?",
+                (guild_id, content_id, user_id))
+            if cur.rowcount == 0:
+                await DB.rollback()
+                return False, "У пользователя нет аттенданса за этот контент."
+            await DB.execute(
+                """INSERT INTO attendance_events
+                   (guild_id, user_id, content_id, delta, kind, actor_id, created_at)
+                   VALUES (?, ?, ?, -1, 'content_remove', ?, ?)""",
+                (guild_id, user_id, content_id, removed_by, now))
+            await DB.commit()
+        except Exception:
+            await DB.rollback()
+            raise
+    return True, "Аттенданс удалён."
 
 
 async def db_get_joined_at(guild_id: int, user_id: int) -> Optional[int]:
@@ -536,9 +652,11 @@ async def db_get_joined_at(guild_id: int, user_id: int) -> Optional[int]:
 
 
 def window_bounds(scope: str) -> Tuple[int, int]:
-    """(lo, hi) unix-границы окна по awarded_at. Полуинтервал [lo, hi)."""
+    """(lo, hi) unix-границы окна. Полуинтервал [lo, hi). UTC."""
     now = datetime.datetime.now(datetime.timezone.utc)
-    hi = int(now.timestamp()) + 1  # +1 чтобы включить только что начисленное (awarded_at == now)
+    hi = int(now.timestamp()) + 1  # +1 чтобы включить только что начисленное
+    if scope == "all":
+        return 0, hi
     if scope == "week":
         lo = int((now - datetime.timedelta(days=7)).timestamp())
     elif scope == "month":  # текущий календарный месяц
@@ -592,9 +710,9 @@ async def db_att_profile(guild_id: int, user_id: int, scope: str) -> Optional[di
     return res
 
 
-async def db_att_leaderboard_month(guild_id: int) -> List[Tuple[int, int]]:
-    """Лидерборд за текущий календарный месяц (по awarded_at)."""
-    lo, hi = window_bounds("month")
+async def db_att_leaderboard(guild_id: int, scope: str = "month") -> List[Tuple[int, int]]:
+    """Лидерборд посещаемости за окно scope (по awarded_at)."""
+    lo, hi = window_bounds(scope)
     cur = await DB.execute(
         """SELECT user_id, COUNT(*) AS cnt
            FROM attendance_awards
@@ -606,6 +724,11 @@ async def db_att_leaderboard_month(guild_id: int) -> List[Tuple[int, int]]:
     )
     rows = await cur.fetchall()
     return [(int(r[0]), int(r[1])) for r in rows]
+
+
+async def db_att_leaderboard_month(guild_id: int) -> List[Tuple[int, int]]:
+    """Лидерборд за текущий календарный месяц (по awarded_at)."""
+    return await db_att_leaderboard(guild_id, "month")
 
 
 # =========================
@@ -686,7 +809,7 @@ async def db_balance_payout_many(
             await DB.rollback()
             raise
 
-async def db_balance_leaderboard(guild_id: int, limit: int = 200) -> List[Tuple[int, int]]:
+async def db_balance_leaderboard(guild_id: int, limit: int = 10000) -> List[Tuple[int, int]]:
     """Топ по текущему балансу (только > 0)."""
     cur = await DB.execute(
         """SELECT user_id, amount FROM balances
@@ -696,18 +819,255 @@ async def db_balance_leaderboard(guild_id: int, limit: int = 200) -> List[Tuple[
     return [(int(r[0]), int(r[1])) for r in await cur.fetchall()]
 
 
-async def db_balance_events_since(guild_id: int, since_ts: int) -> List[dict]:
-    """Все транзакции с момента since_ts (для CSV-выгрузки)."""
+async def db_balance_bank(guild_id: int) -> Tuple[int, int]:
+    """(сумма всех балансов, число держателей с amount > 0)."""
     cur = await DB.execute(
-        """SELECT created_at, user_id, delta, balance_after, kind, reason, actor_id
-           FROM balance_events
-           WHERE guild_id = ? AND created_at >= ?
-           ORDER BY created_at ASC""",
-        (guild_id, since_ts))
-    rows = await cur.fetchall()
-    return [{"created_at": int(r[0]), "user_id": int(r[1]), "delta": int(r[2]),
-             "balance_after": int(r[3]), "kind": str(r[4]),
-             "reason": (str(r[5]) if r[5] else ""), "actor_id": int(r[6])} for r in rows]
+        """SELECT COALESCE(SUM(amount), 0),
+                  COALESCE(SUM(CASE WHEN amount > 0 THEN 1 ELSE 0 END), 0)
+           FROM balances WHERE guild_id = ?""",
+        (guild_id,))
+    row = await cur.fetchone()
+    return int(row[0]), int(row[1])
+
+
+def _event_row(r) -> dict:
+    return {
+        "created_at": int(r[0]), "user_id": int(r[1]), "delta": int(r[2]),
+        "balance_after": int(r[3]), "kind": str(r[4]),
+        "reason": (str(r[5]) if r[5] else ""), "actor_id": int(r[6]),
+    }
+
+
+async def db_balance_events_range(
+    guild_id: int, lo: int, hi: int, user_id: Optional[int] = None,
+) -> List[dict]:
+    """Транзакции в полуинтервале [lo, hi). Опционально фильтр по user_id."""
+    if user_id is None:
+        cur = await DB.execute(
+            """SELECT created_at, user_id, delta, balance_after, kind, reason, actor_id
+               FROM balance_events
+               WHERE guild_id = ? AND created_at >= ? AND created_at < ?
+               ORDER BY created_at ASC, id ASC""",
+            (guild_id, lo, hi))
+    else:
+        cur = await DB.execute(
+            """SELECT created_at, user_id, delta, balance_after, kind, reason, actor_id
+               FROM balance_events
+               WHERE guild_id = ? AND created_at >= ? AND created_at < ? AND user_id = ?
+               ORDER BY created_at ASC, id ASC""",
+            (guild_id, lo, hi, user_id))
+    return [_event_row(r) for r in await cur.fetchall()]
+
+
+async def db_balance_period_stats(
+    guild_id: int, lo: int, hi: int, user_id: Optional[int] = None,
+) -> dict:
+    """Суммы +/- и число транзакций за окно. user_id=None → вся гильдия."""
+    extra = " AND user_id = ?" if user_id is not None else ""
+    params: tuple = (guild_id, lo, hi) if user_id is None else (guild_id, lo, hi, user_id)
+    cur = await DB.execute(
+        f"""SELECT
+              COALESCE(SUM(CASE WHEN delta > 0 THEN delta ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN delta < 0 THEN -delta ELSE 0 END), 0),
+              COALESCE(SUM(delta), 0),
+              COUNT(*)
+            FROM balance_events
+            WHERE guild_id = ? AND created_at >= ? AND created_at < ?{extra}""",
+        params)
+    row = await cur.fetchone()
+    return {"awarded": int(row[0]), "removed": int(row[1]), "net": int(row[2]), "count": int(row[3])}
+
+
+# =========================
+# SIPHONED ENERGY
+# =========================
+_SIPHON_TS = "%Y-%m-%d %H:%M:%S"
+
+
+def parse_siphon_txt(text: str) -> Tuple[List[dict], List[str]]:
+    """Парсит TSV из игры: Date, Player, Reason, Amount. (rows, errors)."""
+    rows: List[dict] = []
+    errors: List[str] = []
+    raw = text.lstrip("\ufeff")
+    reader = csv.reader(io.StringIO(raw), delimiter="\t", quotechar='"')
+    header_skipped = False
+    for lineno, parts in enumerate(reader, start=1):
+        if not parts or all(not (p or "").strip() for p in parts):
+            continue
+        if not header_skipped:
+            joined = " ".join(p.strip().strip('"') for p in parts).lower()
+            header_skipped = True
+            if "date" in joined and "player" in joined:
+                continue
+        if len(parts) < 4:
+            errors.append(f"стр. {lineno}: мало колонок")
+            continue
+        date_s = parts[0].strip().strip('"')
+        player = parts[1].strip().strip('"')
+        reason = parts[2].strip().strip('"')
+        amount_s = parts[3].strip().strip('"').replace(" ", "").replace(",", "")
+        if not player:
+            errors.append(f"стр. {lineno}: пустой ник")
+            continue
+        reason_norm = reason.capitalize()
+        if reason_norm not in ("Deposit", "Withdrawal"):
+            errors.append(f"стр. {lineno}: неизвестный Reason `{reason}`")
+            continue
+        try:
+            amount = int(amount_s)
+        except ValueError:
+            errors.append(f"стр. {lineno}: сумма `{amount_s}`")
+            continue
+        try:
+            dt = datetime.datetime.strptime(date_s, _SIPHON_TS)
+        except ValueError:
+            errors.append(f"стр. {lineno}: дата `{date_s}`")
+            continue
+        if reason_norm == "Deposit" and amount < 0:
+            amount = abs(amount)
+        if reason_norm == "Withdrawal" and amount > 0:
+            amount = -amount
+        rows.append({
+            "occurred_at": int(dt.replace(tzinfo=datetime.timezone.utc).timestamp()),
+            "occurred_at_raw": date_s,
+            "player": player,
+            "player_key": player.casefold(),
+            "reason": reason_norm,
+            "amount": amount,
+        })
+    return rows, errors
+
+
+async def db_siphon_import(guild_id: int, rows: List[dict], actor_id: int) -> Tuple[int, int]:
+    """Вставляет только новые строки. Возвращает (inserted, skipped)."""
+    inserted = skipped = 0
+    now = int(time.time())
+    async with DB_WLOCK:
+        await DB.execute("BEGIN IMMEDIATE")
+        try:
+            for r in rows:
+                cur = await DB.execute(
+                    """INSERT OR IGNORE INTO siphon_events
+                       (guild_id, occurred_at, occurred_at_raw, player_key, player,
+                        reason, amount, imported_at, imported_by)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (guild_id, r["occurred_at"], r["occurred_at_raw"], r["player_key"],
+                     r["player"], r["reason"], r["amount"], now, actor_id),
+                )
+                if cur.rowcount and cur.rowcount > 0:
+                    inserted += 1
+                    dep = r["amount"] if r["amount"] > 0 else 0
+                    wth = -r["amount"] if r["amount"] < 0 else 0
+                    await DB.execute(
+                        """INSERT INTO siphon_balances
+                           (guild_id, player_key, player, deposited, withdrawn, net, ops, last_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                           ON CONFLICT(guild_id, player_key) DO UPDATE SET
+                             player = excluded.player,
+                             deposited = deposited + excluded.deposited,
+                             withdrawn = withdrawn + excluded.withdrawn,
+                             net = net + excluded.net,
+                             ops = ops + 1,
+                             last_at = MAX(COALESCE(last_at, 0), excluded.last_at),
+                             updated_at = excluded.updated_at""",
+                        (guild_id, r["player_key"], r["player"], dep, wth, r["amount"],
+                         r["occurred_at"], now),
+                    )
+                else:
+                    skipped += 1
+            await DB.commit()
+        except Exception:
+            await DB.rollback()
+            raise
+    return inserted, skipped
+
+
+async def db_siphon_player(guild_id: int, nick: str) -> Optional[dict]:
+    key = nick.strip().casefold()
+    cur = await DB.execute(
+        """SELECT player, deposited, withdrawn, net, ops, last_at
+           FROM siphon_balances WHERE guild_id = ? AND player_key = ?""",
+        (guild_id, key),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    cur = await DB.execute(
+        """SELECT occurred_at_raw, reason, amount FROM siphon_events
+           WHERE guild_id = ? AND player_key = ?
+           ORDER BY occurred_at DESC, occurred_at_raw DESC LIMIT 20""",
+        (guild_id, key),
+    )
+    events = [{"at": str(e[0]), "reason": str(e[1]), "amount": int(e[2])}
+              for e in await cur.fetchall()]
+    return {
+        "player": str(row[0]),
+        "deposited": int(row[1]),
+        "withdrawn": int(row[2]),
+        "net": int(row[3]),
+        "ops": int(row[4]),
+        "last_at": int(row[5]) if row[5] else None,
+        "events": events,
+    }
+
+
+async def db_siphon_suggest(guild_id: int, nick: str, limit: int = 8) -> List[str]:
+    key = nick.strip().casefold()
+    cur = await DB.execute(
+        """SELECT player FROM siphon_balances
+           WHERE guild_id = ? AND player_key LIKE ?
+           ORDER BY ops DESC LIMIT ?""",
+        (guild_id, f"%{key}%", limit),
+    )
+    return [str(r[0]) for r in await cur.fetchall()]
+
+
+async def db_siphon_leaderboard(guild_id: int) -> List[dict]:
+    cur = await DB.execute(
+        """SELECT player, deposited, withdrawn, net, ops
+           FROM siphon_balances WHERE guild_id = ?
+           ORDER BY net DESC, player ASC""",
+        (guild_id,),
+    )
+    return [{"player": str(r[0]), "deposited": int(r[1]), "withdrawn": int(r[2]),
+             "net": int(r[3]), "ops": int(r[4])} for r in await cur.fetchall()]
+
+
+async def db_siphon_summary(guild_id: int) -> Optional[dict]:
+    cur = await DB.execute(
+        """SELECT COUNT(*),
+                  COALESCE(SUM(deposited), 0),
+                  COALESCE(SUM(withdrawn), 0),
+                  COALESCE(SUM(net), 0),
+                  COALESCE(SUM(ops), 0),
+                  COALESCE(SUM(CASE WHEN net < 0 THEN 1 ELSE 0 END), 0),
+                  COALESCE(SUM(CASE WHEN net > 0 THEN 1 ELSE 0 END), 0)
+           FROM siphon_balances WHERE guild_id = ?""",
+        (guild_id,),
+    )
+    b = await cur.fetchone()
+    if b is None or int(b[0]) == 0:
+        return None
+    cur = await DB.execute(
+        """SELECT MIN(imported_at), MAX(imported_at),
+                  MIN(occurred_at_raw), MAX(occurred_at_raw)
+           FROM siphon_events WHERE guild_id = ?""",
+        (guild_id,),
+    )
+    e = await cur.fetchone()
+    return {
+        "players": int(b[0]),
+        "deposited": int(b[1]),
+        "withdrawn": int(b[2]),
+        "net": int(b[3]),
+        "ops": int(b[4]),
+        "debtors": int(b[5]),
+        "creditors": int(b[6]),
+        "import_first": int(e[0]) if e and e[0] else None,
+        "import_last": int(e[1]) if e and e[1] else None,
+        "log_first": str(e[2]) if e and e[2] else None,
+        "log_last": str(e[3]) if e and e[3] else None,
+    }
 
 
 # =========================
@@ -715,6 +1075,66 @@ async def db_balance_events_since(guild_id: int, since_ts: int) -> List[dict]:
 # =========================
 def ts_discord(unix_ts: int, fmt: str = "F") -> str:
     return f"<t:{unix_ts}:{fmt}>"
+
+
+def fmt_money(n: int) -> str:
+    return f"{n:,}".replace(",", " ") + f" {CURRENCY}"
+
+
+def make_csv_file(filename: str, header: List[str], rows: List[list]) -> discord.File:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(header)
+    writer.writerows(rows)
+    return discord.File(fp=io.BytesIO(output.getvalue().encode("utf-8-sig")), filename=filename)
+
+
+def thread_name_for(title: str, content_id: int) -> str:
+    suffix = f" (CS#{content_id})"
+    room = 100 - len(suffix)
+    if room < 1:
+        return f"CS#{content_id}"[:100]
+    base = (title or "Content").strip() or "Content"
+    if len(base) > room:
+        base = base[: max(1, room - 1)] + "…"
+    return (base + suffix)[:100]
+
+
+def add_chunked_field(embed: discord.Embed, name: str, lines: List[str], limit: int = 950) -> None:
+    """Режет длинные списки на несколько field (лимит Discord 1024 / 25 fields)."""
+    if not lines:
+        return
+    leftover_budget = max(1, 20 - len(embed.fields))
+    chunk: List[str] = []
+    chunk_size = 0
+    field_num = 0
+    skipped = 0
+    for line in lines:
+        if field_num >= leftover_budget:
+            skipped += 1
+            continue
+        if chunk_size + len(line) + 1 > limit and chunk:
+            embed.add_field(
+                name=name if field_num == 0 else "\u200b",
+                value="\n".join(chunk),
+                inline=False,
+            )
+            field_num += 1
+            chunk, chunk_size = [], 0
+            if field_num >= leftover_budget:
+                skipped += 1
+                continue
+        chunk.append(line)
+        chunk_size += len(line) + 1
+    if chunk and field_num < leftover_budget:
+        embed.add_field(
+            name=name if field_num == 0 else "\u200b",
+            value="\n".join(chunk),
+            inline=False,
+        )
+        field_num += 1
+    if skipped:
+        embed.add_field(name="\u200b", value=f"… и ещё {skipped}", inline=False)
 
 
 def parse_utc_time(time_str: str) -> Optional[int]:
@@ -748,7 +1168,7 @@ def member_is_staff(member: discord.Member) -> bool:
 
 
 def member_is_rl(member: discord.Member) -> bool:
-    """RL — может /content_create."""
+    """RL — может создавать обязательный контент."""
     return bool(RL_ROLE_IDS & {r.id for r in member.roles})
 
 
@@ -757,9 +1177,18 @@ def member_is_recruit(member: discord.Member) -> bool:
     return bool(RECRUIT_ROLE_IDS & {r.id for r in member.roles})
 
 
-def member_can_create_content(member: discord.Member) -> bool:
-    """Создавать контент: стафф + RL."""
+def member_can_create_mandatory(member: discord.Member) -> bool:
+    """Обязательный контент: стафф или RL."""
     return member_is_staff(member) or member_is_rl(member)
+
+
+def member_can_create_content(member: discord.Member, content_type: Optional[str] = None) -> bool:
+    """Необязательный — любой участник сервера. Обязательный — стафф/RL."""
+    if content_type == TYPE_OPTIONAL:
+        return True
+    if content_type == TYPE_MANDATORY:
+        return member_can_create_mandatory(member)
+    return member_can_create_mandatory(member)
 
 
 def is_organizer_or_admin(member: discord.Member, created_by: int) -> bool:
@@ -818,25 +1247,17 @@ def build_main_post_embed(content_row, roster, attendance_only) -> discord.Embed
     embed.add_field(name="Status", value="🟢 Open" if is_open else "🔴 Closed", inline=True)
     embed.add_field(name="Players", value=f"**{participants_count}**", inline=True)
 
-    # Роли (чанками)
     roles_fmt = [
         f"`{i}.` {rn} — <@{by_index[i]}>" if by_index.get(i) else f"`{i}.` {rn} —"
         for i, rn in enumerate(roles_lines, start=1)
     ]
-    chunk, chunk_size, field_num = [], 0, 0
-    for line in roles_fmt:
-        if chunk_size + len(line) + 1 > 950 and chunk:
-            embed.add_field(name="📝 Roles" if field_num == 0 else "\u200b", value="\n".join(chunk), inline=False)
-            chunk, chunk_size, field_num = [], 0, field_num + 1
-        chunk.append(line); chunk_size += len(line) + 1
-    if chunk:
-        embed.add_field(name="📝 Roles" if field_num == 0 else "\u200b", value="\n".join(chunk), inline=False)
+    add_chunked_field(embed, "📝 Roles", roles_fmt)
 
     if attendance_only:
         start = len(roles_lines) + 1
         att_lines = [f"`{j}.` {lbl} — <@{uid}>" if lbl else f"`{j}.` <@{uid}>"
                      for j, (uid, lbl) in enumerate(attendance_only, start=start)]
-        embed.add_field(name="➕ Additionally", value="\n".join(att_lines[:20]), inline=False)
+        add_chunked_field(embed, "➕ Additionally", att_lines)
 
     if builds_link:
         embed.add_field(name="🔗 Билды", value=builds_link, inline=False)
@@ -849,14 +1270,51 @@ def build_main_post_embed(content_row, roster, attendance_only) -> discord.Embed
     else:
         embed.add_field(name="🔒 Запись закрыта", value="Самозапись недоступна.", inline=False)
 
-    if photo_url:
-        embed.set_image(url=photo_url)
+    if photo_url and str(photo_url).startswith(("http://", "https://", "attachment://")):
+        embed.set_image(url=str(photo_url))
     return embed
+
+
+def attachment_embed_url(filename: str) -> str:
+    return f"attachment://{filename}"
+
+
+async def resolve_photo_url(guild: discord.Guild, stored: Optional[str]) -> Optional[str]:
+    """Достаёт актуальный HTTPS URL с сообщения-хранилища (att:channel:message)."""
+    if not stored:
+        return None
+    if stored.startswith("att:"):
+        try:
+            _, ch_id, msg_id = stored.split(":", 2)
+            ch = guild.get_channel(int(ch_id)) or guild.get_thread(int(ch_id))
+            if ch is None:
+                try:
+                    ch = await guild.fetch_channel(int(ch_id))
+                except discord.HTTPException:
+                    ch = await bot.fetch_channel(int(ch_id))
+            m = await ch.fetch_message(int(msg_id))
+            if m.attachments:
+                return m.attachments[0].url
+            if m.embeds and m.embeds[0].image and m.embeds[0].image.url:
+                return m.embeds[0].image.url
+        except Exception as e:
+            log.warning("resolve_photo_url %s: %r", stored, e)
+        return None
+    if stored.startswith(("http://", "https://")):
+        return stored
+    return None
 
 
 async def refresh_main_post(guild: discord.Guild, content_row) -> None:
     try:
+        if not content_row["message_id"]:
+            return
         channel = guild.get_channel(int(content_row["channel_id"]))
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(int(content_row["channel_id"]))
+            except Exception:
+                return
         if not isinstance(channel, discord.TextChannel):
             return
         msg = await channel.fetch_message(int(content_row["message_id"]))
@@ -865,12 +1323,50 @@ async def refresh_main_post(guild: discord.Guild, content_row) -> None:
         roster_uids = {uid for _, uid in roster}
         attendance_only = [(uid, lbl) for uid, lbl in attend if uid not in roster_uids]
         embed = build_main_post_embed(content_row, roster, attendance_only)
-        # attachments не трогаем => фото (аттач этого же сообщения) остаётся валидным.
-        await msg.edit(content="@everyone", embed=embed,
-                       allowed_mentions=discord.AllowedMentions(everyone=False))
+
+        edit_kwargs = {"embed": embed}
+        if msg.attachments:
+            # Файл на этом же сообщении: attachment:// + явно оставить аттачи,
+            # иначе после edit картинка выпадает из эмбеда наверх.
+            embed.set_image(url=attachment_embed_url(msg.attachments[0].filename))
+            edit_kwargs["attachments"] = list(msg.attachments)
+        else:
+            stored = str(content_row["photo_url"]) if content_row["photo_url"] else None
+            image_url = await resolve_photo_url(guild, stored)
+            if image_url:
+                embed.set_image(url=image_url)
+
+        await msg.edit(**edit_kwargs)
     except Exception as e:
-        print(f"[refresh_main_post] content={content_row['id']}: {e!r}")
+        log.warning("refresh_main_post content=%s: %r", content_row["id"], e)
         return
+
+
+_REFRESH_DELAY = 0.4
+_refresh_tasks: Dict[Tuple[int, int], asyncio.Task] = {}
+_refresh_guard = asyncio.Lock()
+
+
+async def schedule_refresh(guild: discord.Guild, content_id: int) -> None:
+    """Схлопывает пачку записей в один edit поста."""
+    key = (guild.id, content_id)
+
+    async def _run():
+        try:
+            await asyncio.sleep(_REFRESH_DELAY)
+            row = await db_get_content_by_id(content_id, guild.id)
+            if row is not None:
+                await refresh_main_post(guild, row)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            log.warning("schedule_refresh content=%s: %r", content_id, e)
+
+    async with _refresh_guard:
+        prev = _refresh_tasks.get(key)
+        if prev is not None and not prev.done():
+            prev.cancel()
+        _refresh_tasks[key] = asyncio.create_task(_run())
 
 
 def parse_thread_command(text: str) -> Tuple[str, Optional[int]]:
@@ -885,8 +1381,8 @@ def parse_thread_command(text: str) -> Tuple[str, Optional[int]]:
     m = re.match(r"^\+(\d+)\s+.+$", t)
     if m:
         return "org_assign_slot", int(m.group(1))
-    # +метка @user — доп. участник с подписью роли
-    if t.startswith("+") and re.search(r"<@!?\d+>", t) and not re.match(r"^\+\d+\s", t):
+    # +метка @user — сразу после + идёт текст метки (не пробел)
+    if re.match(r"^\+\S+.*<@!?\d+>", t) and not re.match(r"^\+\d+\s", t):
         return "org_assign_label", None
     if t.startswith("+"):
         return "org_attend_add", None
@@ -899,63 +1395,19 @@ def parse_thread_command(text: str) -> Tuple[str, Optional[int]]:
 
 
 # =========================
-# OCR
-# =========================
-def ocr_extract_names(image_bytes: bytes) -> List[str]:
-    """OCR скрина -> кандидаты-ники (по строкам). Лёгкий препроцессинг под тёмную тему DC."""
-    img = Image.open(io.BytesIO(image_bytes)).convert("L")
-    # Апскейл мелкого текста + автоконтраст
-    if max(img.size) < 1600:
-        scale = 1600 / max(img.size)
-        img = img.resize((int(img.width * scale), int(img.height * scale)))
-    img = ImageOps.autocontrast(img)
-    raw = pytesseract.image_to_string(img, lang="rus+eng")
-    out, seen = [], set()
-    for ln in raw.splitlines():
-        s = ln.strip()
-        # отбрасываем мусор: слишком коротко/только символы
-        if len(s) < 2 or not re.search(r"[A-Za-zА-Яа-я0-9]", s):
-            continue
-        # ник дискорда обычно одно "слово"; берём самый длинный токен строки
-        token = max(s.split(), key=len)
-        token = token.strip("|•·.,:#@()[]")
-        if len(token) >= 2 and token.lower() not in seen:
-            seen.add(token.lower()); out.append(token)
-    return out
-
-
-def match_members(guild: discord.Guild, tokens: List[str]) -> Tuple[List[Tuple[str, discord.Member, int]], List[str]]:
-    """Фуззи-матч токенов к мемберам. Возвращает (matched[(token,member,score)], unmatched_tokens)."""
-    choices = {}
-    for m in guild.members:
-        choices[m.display_name] = m
-        if m.name not in choices:
-            choices[m.name] = m
-    names = list(choices.keys())
-    matched, unmatched, used = [], [], set()
-    for tok in tokens:
-        best = rf_process.extractOne(tok, names, scorer=rf_fuzz.WRatio, score_cutoff=FUZZ_CUTOFF)
-        if best is None:
-            unmatched.append(tok); continue
-        member = choices[best[0]]
-        if member.id in used:
-            continue
-        used.add(member.id)
-        matched.append((tok, member, int(best[1])))
-    return matched, unmatched
-
-
-# =========================
 # LEADERBOARD VIEW
 # =========================
 class LeaderboardView(discord.ui.View):
-    def __init__(self, rows, guild, requester_id, my_count, money: bool = False):
+    def __init__(self, rows, guild, requester_id, my_count, money: bool = False,
+                 total_sum: int = 0, subtitle: Optional[str] = None):
         super().__init__(timeout=300)
         self.rows = rows
         self.guild = guild
         self.requester_id = requester_id
         self.my_count = my_count
         self.money = money
+        self.total_sum = total_sum
+        self.subtitle = subtitle
         self.page = 0
         self.total_pages = max(1, (len(rows) + LEADERBOARD_PAGE_SIZE - 1) // LEADERBOARD_PAGE_SIZE)
         self._update_buttons()
@@ -966,12 +1418,20 @@ class LeaderboardView(discord.ui.View):
         self.page_label.label = f"{self.page + 1} / {self.total_pages}"
 
     def build_embed(self) -> discord.Embed:
-        title = "💰 Лидерборд по балансу" if self.money else "🏆 Лидерборд посещаемости (текущий месяц)"
+        if self.money:
+            title = "💰 Лидерборд по балансу"
+            header = (
+                f"Общий баланс (к раздаче): **{fmt_money(self.total_sum)}**\n"
+                f"Держателей: **{len(self.rows)}**"
+            )
+        else:
+            title = "🏆 Лидерборд посещаемости (текущий месяц)"
+            header = self.subtitle or ""
         embed = discord.Embed(title=title, color=COLOR_GOLD)
         start_idx = self.page * LEADERBOARD_PAGE_SIZE
         page_rows = self.rows[start_idx:start_idx + LEADERBOARD_PAGE_SIZE]
         if not page_rows:
-            embed.description = "_Пока пусто_"
+            body = "_Пока пусто_"
         else:
             lines = []
             for i, (uid, val) in enumerate(page_rows, start=start_idx + 1):
@@ -980,7 +1440,8 @@ class LeaderboardView(discord.ui.View):
                 name = member.display_name if member else f"<@{uid}>"
                 val_str = fmt_money(val) if self.money else str(val)
                 lines.append(f"{medal} **{i}.** {name} **·** {val_str}")
-            embed.description = "\n".join(lines)
+            body = "\n".join(lines)
+        embed.description = f"{header}\n\n{body}" if header else body
         my_str = fmt_money(self.my_count) if self.money else f"{self.my_count}"
         suffix = "Ваш баланс" if self.money else "Ваш результат за месяц"
         embed.set_footer(text=f"{suffix}: {my_str}  •  Стр. {self.page + 1}/{self.total_pages}")
@@ -1004,115 +1465,6 @@ class LeaderboardView(discord.ui.View):
 
 
 # =========================
-# OCR -> ROLE: confirm/edit view
-# =========================
-class OcrRoleEditModal(discord.ui.Modal, title="Править список"):
-    def __init__(self, parent_view: "OcrRoleView"):
-        super().__init__()
-        self.parent_view = parent_view
-        prefill = " ".join(f"<@{m.id}>" for m in parent_view.members)
-        if parent_view.unmatched:
-            prefill += "\n# Не распознаны: " + ", ".join(parent_view.unmatched)
-        self.mentions_input = discord.ui.TextInput(
-            label="Упоминания (@user @user ...)",
-            style=discord.TextStyle.paragraph,
-            default=prefill[:4000],
-            max_length=4000,
-        )
-        self.add_item(self.mentions_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        ids = parse_user_ids_from_text(str(self.mentions_input))
-        members = []
-        for uid in ids:
-            m = interaction.guild.get_member(uid)
-            if m is None:
-                try:
-                    m = await interaction.guild.fetch_member(uid)
-                except Exception:
-                    m = None
-            if m:
-                members.append(m)
-        self.parent_view.members = members
-        self.parent_view.unmatched = []
-        await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
-
-
-class OcrRoleView(discord.ui.View):
-    def __init__(self, members: List[discord.Member], unmatched: List[str], role_name: str, author_id: int):
-        super().__init__(timeout=300)
-        self.members = members
-        self.unmatched = unmatched
-        self.role_name = role_name
-        self.author_id = author_id
-
-    def build_embed(self) -> discord.Embed:
-        embed = discord.Embed(
-            title="🖼️ Распознанные участники",
-            description=f"Будет создана роль **`{self.role_name}`** и выдана {len(self.members)} участникам.",
-            color=COLOR_BLUE,
-        )
-        if self.members:
-            embed.add_field(
-                name=f"✅ Совпало ({len(self.members)})",
-                value="\n".join(m.mention for m in self.members[:30]) or "—",
-                inline=False,
-            )
-        if self.unmatched:
-            embed.add_field(
-                name=f"❓ Не распознаны ({len(self.unmatched)})",
-                value=", ".join(self.unmatched[:30]),
-                inline=False,
-            )
-        embed.set_footer(text="Проверь список. «Править» — поправить вручную.")
-        return embed
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("Это не твоё подтверждение.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="Подтвердить и выдать", style=discord.ButtonStyle.success, emoji="✅")
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        guild = interaction.guild
-        if not self.members:
-            await interaction.followup.send("Список пуст.", ephemeral=True)
-            return
-        try:
-            role = await guild.create_role(name=self.role_name, reason="CS role from screenshot")
-        except discord.Forbidden:
-            await interaction.followup.send("Нет прав на создание роли.", ephemeral=True)
-            return
-        assigned, failed = 0, []
-        for m in self.members:
-            try:
-                await m.add_roles(role, reason="CS role from screenshot")
-                assigned += 1
-            except discord.Forbidden:
-                failed.append(m.mention)
-        for item in self.children:
-            item.disabled = True
-        embed = discord.Embed(title="✅ Роль создана", color=COLOR_GREEN)
-        embed.add_field(name="Роль", value=f"`{role.name}`", inline=False)
-        embed.add_field(name="Выдано", value=f"{assigned}/{len(self.members)}", inline=True)
-        if failed:
-            embed.add_field(name="Не удалось", value=", ".join(failed[:10]), inline=False)
-        await interaction.edit_original_response(embed=embed, view=self)
-
-    @discord.ui.button(label="Править", style=discord.ButtonStyle.secondary, emoji="✏️")
-    async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(OcrRoleEditModal(self))
-
-    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.danger, emoji="✖️")
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(content="Отменено.", embed=None, view=self)
-
-
-# =========================
 # BOT
 # =========================
 intents = discord.Intents.default()
@@ -1126,21 +1478,28 @@ def build_help_embed() -> discord.Embed:
     e.add_field(name="👥 Для всех", inline=False, value=(
         "`/balance` · `!bal [@user]` — баланс\n"
         "`/att_profile` · `!att [@user]` — посещаемость\n"
-        "`/att_stats` · `!lb` — лидерборд месяца\n"
-        "`/economy_lb` · `!economy-lb` — топ по балансу\n"
-        "`/help` · `!help` — это меню · `/healthcheck` — статус"))
+        "`/att_stats` · `!lb` — лидерборд посещаемости (месяц)\n"
+        "`/economy_lb` · `!economy-lb` — лидерборд балансов + сумма к раздаче\n"
+        "`/content_create` необязательный — любой участник\n"
+        "`/energy <ник>` · `!energy <ник>` — энергия игрока\n"
+        "`/energy_lb` · `!energy-lb` — лидерборд энергии\n"
+        "`/help` · `!help` — это меню · `/healthcheck` · `!healthcheck` — статус"))
     e.add_field(name="🧵 В ветке", inline=False, value="`<цифра>` — занять роль · `-` — выписаться")
     e.add_field(name="🛡️ Стафф / Орг", inline=False, value=(
-        "`/content_create` · `/content_close <id>`\n"
+        "`/content_create` обязательный — стафф / RL\n"
+        "`/content_close <id>` · `/content_list` · `!content-list`\n"
         "`/content_copy <id>` · `!copy <id>` — скопировать кол\n"
-        "`/add_ppl` · `/att_add <id>` · `/att_remove <id> @user` · `/att_export_csv`\n"
-        "`/role_from_content <id>` · `/role_from_screenshot` · `/role_clear <id>`"))
+        "`/add_ppl` · `/att_add <id>` · `/att_remove <id> @user`\n"
+        "`/att_export_csv` · `!att-export` — выгрузка лб посещаемости\n"
+        "`/role_from_content <id>` · `/role_clear <id>`"))
     e.add_field(name="💰 Деньги (стафф)", inline=False, value=(
         "`/money_add` · `!add-money @user сумма`\n"
         "`/money_sub` · `!remove-money @user сумма`\n"
         "`/money_payout_role` · `!add-money-role @role сумма`\n"
-        "`/money_payout_content <id> сумма [force]` · `!economy-stats`\n"
-        "`/economy_export_csv [days]` — выгрузка транзакций"))
+        "`/money_payout_content <id> сумма [force]`\n"
+        "`/economy_stats` · `!economy-stats` — общая стата\n"
+        "`/economy_export_csv` · `!economy-export [@user]` — лб + все +/-\n"
+        "`/energy_import` — залить txt лог энергии"))
     e.add_field(name="🧵 В ветке (стафф)", inline=False, value=(
         "`+хилл @user` · `+2 @user` · `-2` · `- @user` · `+ @user...`"))
     return e
@@ -1153,15 +1512,64 @@ async def help_slash(interaction: discord.Interaction):
 async def help_prefix(ctx: commands.Context):
     await ctx.reply(embed=build_help_embed(), mention_author=False)
 
+_STARTED = False
+
+
 @bot.event
 async def on_ready():
-    await db_init()
+    global _STARTED
+    if not _STARTED:
+        await db_init()
+        try:
+            if GUILD_ID:
+                gobj = discord.Object(id=GUILD_ID)
+                bot.tree.copy_global_to(guild=gobj)
+                synced = await bot.tree.sync(guild=gobj)
+            else:
+                synced = await bot.tree.sync()
+            log.info("Synced commands: %s", len(synced))
+        except Exception as e:
+            log.error("Sync error: %s", e)
+        _STARTED = True
+    log.info("Logged in as %s (id=%s)", bot.user, bot.user.id)
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply(f"Не хватает аргумента: `{error.param.name}`.", mention_author=False)
+        return
+    if isinstance(error, (commands.BadArgument, commands.MemberNotFound,
+                          commands.RoleNotFound, commands.UserNotFound,
+                          commands.BadUnionArgument)):
+        await ctx.reply("Не удалось разобрать аргумент. Проверь упоминание и число.", mention_author=False)
+        return
+    log.error("command_error %s: %r", ctx.command, error)
     try:
-        synced = await bot.tree.sync()
-        print(f"Ready. Synced commands: {len(synced)}")
-    except Exception as e:
-        print("Sync error:", e)
-    print(f"Logged in as {bot.user} (id={bot.user.id})")
+        await ctx.reply("Ошибка при выполнении команды.", mention_author=False)
+    except Exception:
+        pass
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    err = error.original if isinstance(error, app_commands.CommandInvokeError) else error
+    log.error("app_command_error %s: %r", interaction.command, err)
+    if isinstance(error, app_commands.CommandOnCooldown):
+        msg = f"Кулдаун: {error.retry_after:.1f}с."
+    elif isinstance(error, app_commands.MissingPermissions):
+        msg = "Недостаточно прав."
+    else:
+        msg = "Ошибка при выполнении команды."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
 
 
 # =========================
@@ -1184,7 +1592,7 @@ class ContentCreateModal(discord.ui.Modal, title="Создать контент"
         label="Примечание (опционально)", placeholder="Например: /join NickName", required=False, max_length=900
     )
 
-    def __init__(self, content_type: str, photo: Optional[discord.Attachment], auto_assign_organizer: bool = True):
+    def __init__(self, content_type: str, photo: Optional[discord.Attachment], auto_assign_organizer: bool = False):
         super().__init__()
         self.content_type = content_type
         self.photo = photo
@@ -1192,6 +1600,13 @@ class ContentCreateModal(discord.ui.Modal, title="Создать контент"
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        member = get_member_safe(interaction)
+        if member is None or not member_can_create_content(member, self.content_type):
+            await interaction.followup.send(
+                "Недостаточно прав. Обязательный контент создают стафф или RL.",
+                ephemeral=True,
+            )
+            return
 
         roles_lines = normalize_roles_lines(str(self.roles_text))
         if not roles_lines:
@@ -1213,54 +1628,87 @@ class ContentCreateModal(discord.ui.Modal, title="Создать контент"
         link = str(self.builds_link).strip() or None
         hosted_by = f"<@{interaction.user.id}>"
 
+        guild_id = int(interaction.guild_id)
         content_id = await db_create_content(
-            guild_id=interaction.guild_id, channel_id=channel.id, title=title,
+            guild_id=guild_id, channel_id=channel.id, title=title,
             roles_text="\n".join(roles_lines), after_text=after, created_by=interaction.user.id,
             content_type=self.content_type, hosted_by=hosted_by, start_ts=start_ts, builds_link=link,
         )
 
-        # Шлём пост сразу с фото (аттач этого сообщения => URL не протухает при edit).
+        photo_file = None
         photo_url = None
-        send_kwargs = {"content": "@everyone",
-                       "allowed_mentions": discord.AllowedMentions(everyone=True)}
         if self.photo is not None:
             try:
-                send_kwargs["file"] = await self.photo.to_file()
+                photo_file = await self.photo.to_file()
+                photo_url = attachment_embed_url(photo_file.filename)
             except Exception:
-                pass
-        msg = await channel.send(**send_kwargs)
-        if msg.attachments:
-            photo_url = msg.attachments[0].url
+                photo_file = None
+                photo_url = None
+
+        row0 = await db_get_content_by_id(content_id, guild_id)
+        embed0 = build_main_post_embed(row0, [], []) if row0 else discord.Embed(color=COLOR_GREEN)
+        if photo_url:
+            embed0.set_image(url=photo_url)
+
+        send_kwargs = {
+            "content": "@everyone",
+            "embed": embed0,
+            "allowed_mentions": discord.AllowedMentions(everyone=True),
+        }
+        if photo_file is not None:
+            send_kwargs["file"] = photo_file
+        try:
+            msg = await channel.send(**send_kwargs)
+        except Exception as e:
+            await db_delete_content(content_id, guild_id)
+            log.error("content_create send failed CS#%s: %r", content_id, e)
+            await interaction.followup.send(
+                f"Не удалось отправить пост, контент не создан. ({e})", ephemeral=True)
+            return
         message_id = msg.id
+        if msg.attachments:
+            photo_url = attachment_embed_url(msg.attachments[0].filename)
 
         thread_id = None
-        try:
-            tname = f"{title} (CS#{content_id})"
-            thread = await msg.create_thread(name=tname, auto_archive_duration=1440)
+        thread_note = ""
+        thread = None
+        tname = thread_name_for(title, content_id)
+        for dur in (10080, 4320, 1440):
+            try:
+                thread = await msg.create_thread(name=tname, auto_archive_duration=dur)
+                break
+            except (discord.Forbidden, discord.HTTPException) as e:
+                log.warning("content_create thread dur=%s CS#%s: %r", dur, content_id, e)
+                thread = None
+        if thread is None:
+            thread_note = "\n⚠️ Тред не создан — запись через ветку недоступна."
+        else:
             thread_id = thread.id
-            await thread.send(embed=discord.Embed(
-                title="📖 Инструкция",
-                description=(
-                    "**Как записаться:**\n"
-                    "➣ Напишите **цифру** чтобы занять роль\n"
-                    "➣ Напишите `-` чтобы выписаться\n\n"
-                    "Если запись закрыта — обратитесь к организатору."
-                ),
-                color=COLOR_BLUE
-            ))
-        except discord.Forbidden:
-            thread_id = None
+            try:
+                await thread.send(embed=discord.Embed(
+                    title="📖 Инструкция",
+                    description=(
+                        "**Как записаться:**\n"
+                        "➣ Напишите **цифру** чтобы занять роль\n"
+                        "➣ Напишите `-` чтобы выписаться\n\n"
+                        "Если запись закрыта — обратитесь к организатору."
+                    ),
+                    color=COLOR_BLUE
+                ))
+            except discord.HTTPException as e:
+                log.warning("content_create thread intro CS#%s: %r", content_id, e)
 
-        await db_set_message_thread(content_id, message_id, thread_id, photo_url)
+        await db_set_message_thread(content_id, guild_id, message_id, thread_id, photo_url)
 
         if self.auto_assign_organizer and roles_lines:
             await db_assign_user(content_id, interaction.user.id, 1)
 
-        row = await db_get_content_by_id(content_id)
+        row = await db_get_content_by_id(content_id, guild_id)
         if row and interaction.guild:
             await refresh_main_post(interaction.guild, row)
 
-        await interaction.followup.send(f"✅ Контент создан: **CS#{content_id}**", ephemeral=True)
+        await interaction.followup.send(
+            f"✅ Контент создан: **CS#{content_id}**{thread_note}", ephemeral=True)
 
 
 class AttendAddModal(discord.ui.Modal, title="Добавить людей"):
@@ -1287,7 +1735,7 @@ class AttendAddModal(discord.ui.Modal, title="Добавить людей"):
         except ValueError:
             await interaction.followup.send("Content ID должен быть числом.", ephemeral=True)
             return
-        row = await db_get_content_by_id(content_id)
+        row = await db_get_content_by_id(content_id, int(interaction.guild_id))
         if row is None:
             await interaction.followup.send("Контент не найден.", ephemeral=True)
             return
@@ -1321,9 +1769,8 @@ class AttendAddModal(discord.ui.Modal, title="Добавить людей"):
                 except Exception:
                     failed += 1
 
-        row2 = await db_get_content_by_id(content_id)
-        if row2 and interaction.guild:
-            await refresh_main_post(interaction.guild, row2)
+        if interaction.guild:
+            await schedule_refresh(interaction.guild, content_id)
 
         embed = discord.Embed(title="✅ Участники добавлены", color=COLOR_GREEN)
         embed.add_field(name="Добавлено", value=str(added), inline=True)
@@ -1332,6 +1779,7 @@ class AttendAddModal(discord.ui.Modal, title="Добавить людей"):
             embed.add_field(name="Роль выдана", value=str(assigned), inline=True)
             if failed:
                 embed.add_field(name="Ошибок", value=str(failed), inline=True)
+        embed.set_footer(text="Добавлено в ростер. Стату начисляет /att_add")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -1344,7 +1792,7 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    content = await db_get_content_by_thread(message.channel.id)
+    content = await db_get_content_by_thread(message.channel.id, message.guild.id)
     if content is None:
         await bot.process_commands(message)
         return
@@ -1354,8 +1802,15 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
+    if message.channel.archived:
+        try:
+            await message.channel.edit(archived=False, reason="CS signup")
+        except Exception:
+            pass
+
     content_id = int(content["id"])
     status = str(content["status"])
+    guild_id = int(content["guild_id"])
 
     member = message.guild.get_member(message.author.id)
     if member is None:
@@ -1368,11 +1823,17 @@ async def on_message(message: discord.Message):
     kind, num = parse_thread_command(cmd)
 
     if kind == "self_leave":
-        removed = await db_unassign_user(content_id, message.author.id)
-        await message.add_reaction("✅" if removed else "ℹ️")
-        row2 = await db_get_content_by_id(content_id)
-        if row2:
-            await refresh_main_post(message.guild, row2)
+        if status != STATUS_OPEN:
+            await _try_delete_command(message)
+            try:
+                await message.channel.send("🔒 Запись закрыта.", delete_after=5)
+            except Exception:
+                pass
+            return
+        removed_slot = await db_unassign_user(content_id, message.author.id)
+        removed_att = await db_attend_remove(content_id, message.author.id)
+        await message.add_reaction("✅" if (removed_slot or removed_att) else "ℹ️")
+        await schedule_refresh(message.guild, content_id)
         await _try_delete_command(message)
         return
 
@@ -1411,9 +1872,7 @@ async def on_message(message: discord.Message):
         await message.add_reaction("✅" if ok else "⛔")
         if not ok:
             await message.reply(txt, mention_author=False)
-        row2 = await db_get_content_by_id(content_id)
-        if row2:
-            await refresh_main_post(message.guild, row2)
+        await schedule_refresh(message.guild, content_id)
         await _try_delete_command(message)
         return
 
@@ -1429,9 +1888,7 @@ async def on_message(message: discord.Message):
         added, already = await db_attend_add_many(content_id, user_ids, message.author.id)
         await message.add_reaction("✅")
         await message.reply(f"Добавлено: {added}. Уже были: {already}.", mention_author=False)
-        row2 = await db_get_content_by_id(content_id)
-        if row2:
-            await refresh_main_post(message.guild, row2)
+        await schedule_refresh(message.guild, content_id)
         await _try_delete_command(message)
         return
 
@@ -1443,9 +1900,7 @@ async def on_message(message: discord.Message):
         target = message.mentions[0]
         ok, txt = await db_assign_user(content_id, target.id, int(num))
         await message.reply(f"{target.mention}: {txt}", mention_author=False)
-        row2 = await db_get_content_by_id(content_id)
-        if row2:
-            await refresh_main_post(message.guild, row2)
+        await schedule_refresh(message.guild, content_id)
         await _try_delete_command(message)
         return
 
@@ -1459,9 +1914,7 @@ async def on_message(message: discord.Message):
         status_txt = "метка обновлена" if already else "добавлен"
         await message.reply(f"{target.mention} — **{label}** ({status_txt})", mention_author=False)
         await message.add_reaction("\u2705")
-        row2 = await db_get_content_by_id(content_id)
-        if row2:
-            await refresh_main_post(message.guild, row2)
+        await schedule_refresh(message.guild, content_id)
         await _try_delete_command(message)
         return
 
@@ -1470,9 +1923,7 @@ async def on_message(message: discord.Message):
             await message.reply(f"Неверный номер. Допустимо: 1..{max_slot}", mention_author=False); return
         kicked = await db_unassign_by_role_index(content_id, int(num))
         await message.reply("Роль свободна." if kicked is None else f"Выписано с роли {num}: <@{kicked}>", mention_author=False)
-        row2 = await db_get_content_by_id(content_id)
-        if row2:
-            await refresh_main_post(message.guild, row2)
+        await schedule_refresh(message.guild, content_id)
         await _try_delete_command(message)
         return
 
@@ -1482,10 +1933,11 @@ async def on_message(message: discord.Message):
         target = message.mentions[0]
         removed_slot = await db_unassign_user(content_id, target.id)
         removed_att = await db_attend_remove(content_id, target.id)
-        await message.reply("Выписан." if (removed_slot or removed_att) else "Пользователь не записан.", mention_author=False)
-        row2 = await db_get_content_by_id(content_id)
-        if row2:
-            await refresh_main_post(message.guild, row2)
+        removed_award, _ = await db_att_remove_for_content(
+            guild_id, content_id, target.id, message.author.id)
+        gone = removed_slot or removed_att or removed_award
+        await message.reply("Выписан." if gone else "Пользователь не записан.", mention_author=False)
+        await schedule_refresh(message.guild, content_id)
         await _try_delete_command(message)
         return
 
@@ -1509,25 +1961,44 @@ SCOPE_CHOICES = [
     app_commands.Choice(name="Текущий месяц", value="month"),
     app_commands.Choice(name="Прошлый месяц", value="prev_month"),
     app_commands.Choice(name="Последние 3 месяца", value="3months"),
+    app_commands.Choice(name="Всё время", value="all"),
 ]
 SCOPE_LABELS = {"week": "за неделю", "month": "за текущий месяц",
-                "prev_month": "за прошлый месяц", "3months": "за последние 3 месяца"}
+                "prev_month": "за прошлый месяц", "3months": "за последние 3 месяца",
+                "all": "за всё время"}
+
+
+def _health_embed() -> discord.Embed:
+    return discord.Embed(title="✅ Статус бота", description="Бот онлайн, БД доступна.", color=COLOR_GREEN)
+
+
+async def _db_ping() -> None:
+    if DB is None:
+        raise RuntimeError("БД не инициализирована")
+    await DB.execute("SELECT 1")
 
 
 @bot.tree.command(name="healthcheck", description="Проверка статуса бота и базы данных")
 async def healthcheck(interaction: discord.Interaction):
     try:
-        await DB.execute("SELECT 1")
-        embed = discord.Embed(title="✅ Статус бота",
-                              description=f"Бот онлайн, БД доступна.\nOCR: {'✅' if OCR_AVAILABLE else '❌ не установлен'}",
-                              color=COLOR_GREEN)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await _db_ping()
+        await interaction.response.send_message(embed=_health_embed(), ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(
             embed=discord.Embed(title="❌ Ошибка", description=str(e), color=COLOR_RED), ephemeral=True)
 
 
-@bot.tree.command(name="content_create", description="Создать контент через форму")
+@bot.command(name="healthcheck")
+async def healthcheck_prefix(ctx: commands.Context):
+    try:
+        await _db_ping()
+        await ctx.reply(embed=_health_embed(), mention_author=False)
+    except Exception as e:
+        await ctx.reply(embed=discord.Embed(title="❌ Ошибка", description=str(e), color=COLOR_RED),
+                        mention_author=False)
+
+
+@bot.tree.command(name="content_create", description="Создать контент. Необязательный — все, обязательный — стафф/RL")
 @app_commands.describe(type="Тип контента", photo="Картинка к посту (опционально)")
 @app_commands.choices(type=TYPE_CHOICES)
 async def content_create(
@@ -1539,8 +2010,14 @@ async def content_create(
         await interaction.response.send_message("Вложение должно быть картинкой.", ephemeral=True)
         return
     member = get_member_safe(interaction)
-    if member is None or not member_can_create_content(member):
-        await interaction.response.send_message("Недостаточно прав. Требуется роль стаффа или RL.", ephemeral=True)
+    if member is None:
+        await interaction.response.send_message("Команду нужно запускать на сервере.", ephemeral=True)
+        return
+    if not member_can_create_content(member, type.value):
+        await interaction.response.send_message(
+            "Обязательный контент могут создавать только стафф и RL.",
+            ephemeral=True,
+        )
         return
     await interaction.response.send_modal(ContentCreateModal(content_type=type.value, photo=photo))
 
@@ -1548,8 +2025,8 @@ async def content_create(
 @bot.tree.command(name="add_ppl", description="Добавить людей в контент")
 async def attend_add(interaction: discord.Interaction):
     default_content_id = None
-    if isinstance(interaction.channel, discord.Thread):
-        row = await db_get_content_by_thread(interaction.channel.id)
+    if isinstance(interaction.channel, discord.Thread) and interaction.guild_id:
+        row = await db_get_content_by_thread(interaction.channel.id, int(interaction.guild_id))
         if row is not None:
             default_content_id = int(row["id"])
     await interaction.response.send_modal(AttendAddModal(default_content_id=default_content_id))
@@ -1558,14 +2035,16 @@ async def attend_add(interaction: discord.Interaction):
 @bot.tree.command(name="content_close", description="Закрыть запись на контент")
 @app_commands.describe(content_id="ID контента")
 async def content_close(interaction: discord.Interaction, content_id: int):
-    row = await db_get_content_by_id(content_id)
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Guild недоступен.", ephemeral=True); return
+    row = await db_get_content_by_id(content_id, int(interaction.guild_id))
     if row is None:
         await interaction.response.send_message("Контент не найден.", ephemeral=True); return
     member = get_member_safe(interaction)
     if member is None or not is_organizer_or_admin(member, int(row["created_by"])):
         await interaction.response.send_message("Недостаточно прав.", ephemeral=True); return
-    await db_close_content(content_id)
-    row2 = await db_get_content_by_id(content_id)
+    await db_close_content(content_id, int(interaction.guild_id))
+    row2 = await db_get_content_by_id(content_id, int(interaction.guild_id))
     if row2 and interaction.guild:
         await refresh_main_post(interaction.guild, row2)
     await interaction.response.send_message(
@@ -1573,16 +2052,73 @@ async def content_close(interaction: discord.Interaction, content_id: int):
         ephemeral=True)
 
 
+STATUS_LIST_CHOICES = [
+    app_commands.Choice(name="Открытые", value=STATUS_OPEN),
+    app_commands.Choice(name="Закрытые", value=STATUS_CLOSED),
+    app_commands.Choice(name="Все", value="all"),
+]
+
+
+async def build_content_list_embed(guild: discord.Guild, status: str) -> discord.Embed:
+    rows = await db_list_contents(guild.id, None if status == "all" else status, limit=25)
+    title_map = {
+        STATUS_OPEN: "📋 Открытый контент",
+        STATUS_CLOSED: "📋 Закрытый контент",
+        "all": "📋 Контент сервера",
+    }
+    embed = discord.Embed(title=title_map.get(status, "📋 Контент"), color=COLOR_BLUE)
+    if not rows:
+        embed.description = "_Пусто_"
+        return embed
+    lines = []
+    for r in rows:
+        cid = int(r["id"])
+        st = "🟢" if str(r["status"]) == STATUS_OPEN else "🔴"
+        start_ts = int(r["start_ts"]) if r["start_ts"] else None
+        when = f" · {ts_discord(start_ts, 'R')}" if start_ts else ""
+        lines.append(f"{st} **#{cid}** {r['title']}{when}")
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="Последние 25. Id для /content_close /att_add /copy")
+    return embed
+
+
+@bot.tree.command(name="content_list", description="Список контентов этого сервера")
+@app_commands.describe(status="Фильтр по статусу")
+@app_commands.choices(status=STATUS_LIST_CHOICES)
+async def content_list(interaction: discord.Interaction, status: str = STATUS_OPEN):
+    await interaction.response.defer(ephemeral=True)
+    member = get_member_safe(interaction)
+    if member is None or not member_can_create_content(member):
+        await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
+    if interaction.guild is None:
+        await interaction.followup.send("Guild недоступен.", ephemeral=True); return
+    await interaction.followup.send(
+        embed=await build_content_list_embed(interaction.guild, status), ephemeral=True)
+
+
+@bot.command(name="content-list")
+async def prefix_content_list(ctx: commands.Context, status: str = "open"):
+    """!content-list [open|closed|all] — список контентов (стафф/RL)."""
+    if ctx.guild is None:
+        return
+    if not (isinstance(ctx.author, discord.Member) and member_can_create_content(ctx.author)):
+        await ctx.reply("❌ Только стафф или RL.", mention_author=False); return
+    st = (status or "open").lower()
+    if st not in (STATUS_OPEN, STATUS_CLOSED, "all"):
+        await ctx.reply("Статус: `open`, `closed`, `all`.", mention_author=False); return
+    await ctx.reply(embed=await build_content_list_embed(ctx.guild, st), mention_author=False)
+
+
 @bot.tree.command(name="role_from_content", description="Создать роль и выдать всем участникам")
 @app_commands.describe(content_id="ID контента", role_name="Название роли (по умолчанию = заголовок)")
 async def role_from_content(interaction: discord.Interaction, content_id: int, role_name: Optional[str] = None):
     await interaction.response.defer(ephemeral=True)
-    row = await db_get_content_by_id(content_id)
+    guild = interaction.guild
+    if guild is None or interaction.guild_id is None:
+        await interaction.followup.send("Guild недоступен."); return
+    row = await db_get_content_by_id(content_id, int(interaction.guild_id))
     if row is None:
         await interaction.followup.send("Контент не найден."); return
-    guild = interaction.guild
-    if guild is None:
-        await interaction.followup.send("Guild недоступен."); return
     member = guild.get_member(interaction.user.id)
     if member is None or not member_is_staff(member):
         await interaction.followup.send("Недостаточно прав."); return
@@ -1590,12 +2126,21 @@ async def role_from_content(interaction: discord.Interaction, content_id: int, r
     if not user_ids:
         await interaction.followup.send("Нет участников."); return
 
+    old_role = guild.get_role(int(row["payout_role_id"])) if row["payout_role_id"] else None
+    if old_role is None and row["payout_role_name"]:
+        old_role = discord.utils.get(guild.roles, name=str(row["payout_role_name"]))
+
     base_name = role_name.strip() if role_name and role_name.strip() else str(row["title"])
     final_role_name = f"{base_name} [CS#{content_id}]"
     try:
         role = await guild.create_role(name=final_role_name, reason=f"CS payout role for content {content_id}")
     except discord.Forbidden:
         await interaction.followup.send("Нет прав на создание роли."); return
+    if old_role is not None and old_role.id != role.id:
+        try:
+            await old_role.delete(reason=f"CS replace payout role for content {content_id}")
+        except discord.HTTPException:
+            pass
 
     failed, assigned = [], 0
     for uid in user_ids:
@@ -1611,7 +2156,7 @@ async def role_from_content(interaction: discord.Interaction, content_id: int, r
         except discord.Forbidden:
             failed.append(uid)
 
-    await db_set_payout_role(content_id, role.id, role.name)
+    await db_set_payout_role(content_id, int(interaction.guild_id), role.id, role.name)
     embed = discord.Embed(title="✅ Роль создана", color=COLOR_GREEN)
     embed.add_field(name="Роль", value=f"`{role.name}`", inline=False)
     embed.add_field(name="Выдано", value=f"{assigned}/{len(user_ids)}", inline=True)
@@ -1620,47 +2165,16 @@ async def role_from_content(interaction: discord.Interaction, content_id: int, r
     await interaction.followup.send(embed=embed)
 
 
-@bot.tree.command(name="role_from_screenshot", description="OCR скрина -> создать роль и выдать распознанным")
-@app_commands.describe(photo="Скрин со списком ников", role_name="Название роли")
-async def role_from_screenshot(interaction: discord.Interaction, photo: discord.Attachment, role_name: str):
-    await interaction.response.defer(ephemeral=True)
-    if not OCR_AVAILABLE:
-        await interaction.followup.send("OCR не установлен (нужны tesseract + pillow/pytesseract/rapidfuzz)."); return
-    if interaction.guild is None:
-        await interaction.followup.send("Guild недоступен."); return
-    member = interaction.guild.get_member(interaction.user.id)
-    if member is None or not (member.guild_permissions.administrator or member.guild_permissions.manage_roles):
-        await interaction.followup.send("Недостаточно прав."); return
-    if not (photo.content_type or "").startswith("image/"):
-        await interaction.followup.send("Вложение должно быть картинкой."); return
-
-    try:
-        img_bytes = await photo.read()
-        tokens = ocr_extract_names(img_bytes)
-    except Exception as e:
-        await interaction.followup.send(f"Ошибка OCR: {e}"); return
-    if not tokens:
-        await interaction.followup.send("Не удалось распознать текст на скрине."); return
-
-    matched, unmatched = match_members(interaction.guild, tokens)
-    members = [m for _, m, _ in matched]
-    if not members and not unmatched:
-        await interaction.followup.send("Совпадений не найдено."); return
-
-    view = OcrRoleView(members=members, unmatched=unmatched, role_name=role_name.strip(), author_id=interaction.user.id)
-    await interaction.followup.send(embed=view.build_embed(), view=view)
-
-
 @bot.tree.command(name="role_clear", description="Удалить payout роль контента")
 @app_commands.describe(content_id="ID контента")
 async def role_clear(interaction: discord.Interaction, content_id: int):
     await interaction.response.defer(ephemeral=True)
-    row = await db_get_content_by_id(content_id)
+    guild = interaction.guild
+    if guild is None or interaction.guild_id is None:
+        await interaction.followup.send("Guild недоступен."); return
+    row = await db_get_content_by_id(content_id, int(interaction.guild_id))
     if row is None:
         await interaction.followup.send("Контент не найден."); return
-    guild = interaction.guild
-    if guild is None:
-        await interaction.followup.send("Guild недоступен."); return
     member = guild.get_member(interaction.user.id)
     if member is None or not member_is_staff(member):
         await interaction.followup.send("Недостаточно прав."); return
@@ -1671,6 +2185,7 @@ async def role_clear(interaction: discord.Interaction, content_id: int):
         await interaction.followup.send("Роль не найдена."); return
     try:
         await role.delete(reason=f"CS payout role cleanup for content {content_id}")
+        await db_clear_payout_role(content_id, int(interaction.guild_id))
         await interaction.followup.send(embed=discord.Embed(title="🗑️ Роль удалена", description=f"`{role.name}`", color=COLOR_RED))
     except discord.Forbidden:
         await interaction.followup.send("Нет прав на удаление роли.")
@@ -1680,11 +2195,11 @@ async def role_clear(interaction: discord.Interaction, content_id: int):
 @app_commands.describe(content_id="ID контента")
 async def att_add(interaction: discord.Interaction, content_id: int):
     await interaction.response.defer(ephemeral=True)
-    row = await db_get_content_by_id(content_id)
+    if interaction.guild is None or interaction.guild_id is None:
+        await interaction.followup.send("Guild недоступен.", ephemeral=True); return
+    row = await db_get_content_by_id(content_id, int(interaction.guild_id))
     if row is None:
         await interaction.followup.send("Контент не найден.", ephemeral=True); return
-    if interaction.guild is None:
-        await interaction.followup.send("Guild недоступен.", ephemeral=True); return
     member = interaction.guild.get_member(interaction.user.id)
     if member is None:
         await interaction.followup.send("Не удалось получить данные участника.", ephemeral=True); return
@@ -1695,9 +2210,8 @@ async def att_add(interaction: discord.Interaction, content_id: int):
         await interaction.followup.send("Нет участников.", ephemeral=True); return
 
     awarded, already = await db_att_award_for_content(
-        guild_id=int(interaction.guild_id), content_id=int(content_id), user_ids=user_ids,
+        guild_id=int(row["guild_id"]), content_id=int(content_id), user_ids=user_ids,
         awarded_by=int(interaction.user.id),
-        content_start_ts=int(row["start_ts"]) if row["start_ts"] else None,
     )
     embed = discord.Embed(title="✅ Аттенданс начислен", color=COLOR_GREEN)
     embed.add_field(name="Начислено", value=str(awarded), inline=True)
@@ -1751,25 +2265,84 @@ async def att_stats(interaction: discord.Interaction):
 @app_commands.describe(content_id="ID контента", user="Пользователь")
 async def att_remove(interaction: discord.Interaction, content_id: int, user: discord.Member):
     await interaction.response.defer(ephemeral=True)
-    row = await db_get_content_by_id(content_id)
+    if interaction.guild is None or interaction.guild_id is None:
+        await interaction.followup.send("Guild недоступен.", ephemeral=True); return
+    row = await db_get_content_by_id(content_id, int(interaction.guild_id))
     if row is None:
         await interaction.followup.send("Контент не найден.", ephemeral=True); return
-    if interaction.guild is None:
-        await interaction.followup.send("Guild недоступен.", ephemeral=True); return
     member = interaction.guild.get_member(interaction.user.id)
     if member is None:
         await interaction.followup.send("Не удалось получить данные участника.", ephemeral=True); return
     if not is_organizer_or_admin(member, int(row["created_by"])):
         await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
     ok, msg_text = await db_att_remove_for_content(
-        guild_id=int(interaction.guild_id), content_id=int(content_id),
+        guild_id=int(row["guild_id"]), content_id=int(content_id),
         user_id=int(user.id), removed_by=int(interaction.user.id),
     )
     await interaction.followup.send(
         embed=discord.Embed(description=msg_text, color=COLOR_GREEN if ok else COLOR_RED), ephemeral=True)
 
 
-@bot.tree.command(name="att_export_csv", description="Выгрузить аттенданс в CSV (с % посещений)")
+async def build_att_export(guild: discord.Guild, scope: str) -> Tuple[Optional[str], Optional[discord.Embed], Optional[discord.File]]:
+    """CSV лидерборда посещаемости + % обяз/необяз. (error, embed, file)."""
+    guild_id = guild.id
+    lb = await db_att_leaderboard(guild_id, scope)
+    count_by_uid = {uid: cnt for uid, cnt in lb}
+
+    cur = await DB.execute("SELECT user_id FROM attendance_join WHERE guild_id = ?", (guild_id,))
+    user_ids = [int(r[0]) for r in await cur.fetchall()]
+    if not user_ids:
+        return "Нет данных для экспорта.", None, None
+
+    rows_data = []
+    for uid in user_ids:
+        data = await db_att_profile(guild_id, uid, scope)
+        if data is None:
+            continue
+        m, o = data[TYPE_MANDATORY], data[TYPE_OPTIONAL]
+        gm = guild.get_member(uid)
+        visits = count_by_uid.get(uid, 0)
+        rows_data.append((visits, m["pct"], [
+            uid,
+            gm.name if gm else "Неизвестно",
+            gm.display_name if gm else f"ID:{uid}",
+            datetime.datetime.fromtimestamp(data["joined_at"], tz=datetime.timezone.utc).strftime("%Y-%m-%d"),
+            visits,
+            m["total"], m["attended"], m["pct"],
+            o["total"], o["attended"], o["pct"],
+        ]))
+    rows_data.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    csv_rows = []
+    rank = 0
+    for visits, _pct, r in rows_data:
+        if visits > 0:
+            rank += 1
+            rank_val: object = rank
+        else:
+            rank_val = ""
+        csv_rows.append([rank_val] + r)
+
+    header = [
+        "Место", "User ID", "Никнейм", "Отображаемое имя", "В сборах с",
+        "Посещений (период)",
+        "Обяз всего", "Обяз посещено", "Обяз %",
+        "Необяз всего", "Необяз посещено", "Необяз %",
+    ]
+    file = make_csv_file(f"attendance_lb_{scope}_{int(time.time())}.csv", header, csv_rows)
+    in_lb = sum(1 for visits, _, _ in rows_data if visits > 0)
+    embed = discord.Embed(
+        title="📥 Выгрузка лидерборда посещаемости",
+        description=(
+            f"Период: **{SCOPE_LABELS.get(scope, scope)}**\n"
+            f"В лидерборде: **{in_lb}** · Всего в сборах: **{len(rows_data)}**"
+        ),
+        color=COLOR_BLUE,
+    )
+    return None, embed, file
+
+
+@bot.tree.command(name="att_export_csv", description="Выгрузить лидерборд посещаемости в CSV (стафф)")
 @app_commands.describe(scope="Период")
 @app_commands.choices(scope=SCOPE_CHOICES)
 async def att_export_csv(interaction: discord.Interaction, scope: str = "month"):
@@ -1777,60 +2350,33 @@ async def att_export_csv(interaction: discord.Interaction, scope: str = "month")
     if interaction.guild is None or interaction.guild_id is None:
         await interaction.followup.send("Guild недоступен.", ephemeral=True); return
     member = interaction.guild.get_member(interaction.user.id)
-    if member is None:
-        await interaction.followup.send("Не удалось получить данные участника.", ephemeral=True); return
-    perms = member.guild_permissions
-    if not (perms.administrator or perms.manage_guild or perms.manage_roles):
+    if member is None or not member_is_staff(member):
         await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
 
-    # Все, у кого есть joined (хоть раз аттендили).
-    cur = await DB.execute("SELECT user_id FROM attendance_join WHERE guild_id = ?", (int(interaction.guild_id),))
-    user_ids = [int(r[0]) for r in await cur.fetchall()]
-    if not user_ids:
-        await interaction.followup.send("Нет данных для экспорта.", ephemeral=True); return
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow([
-        "User ID", "Никнейм", "Отображаемое имя", "В сборах с",
-        "Обяз всего", "Обяз посещено", "Обяз %",
-        "Необяз всего", "Необяз посещено", "Необяз %",
-    ])
-    rows_data = []
-    for uid in user_ids:
-        data = await db_att_profile(int(interaction.guild_id), uid, scope)
-        if data is None:
-            continue
-        m, o = data[TYPE_MANDATORY], data[TYPE_OPTIONAL]
-        gm = interaction.guild.get_member(uid)
-        rows_data.append((m["pct"], [
-            uid,
-            gm.name if gm else "Неизвестно",
-            gm.display_name if gm else f"ID:{uid}",
-            datetime.datetime.fromtimestamp(data["joined_at"], tz=datetime.timezone.utc).strftime("%Y-%m-%d"),
-            m["total"], m["attended"], m["pct"],
-            o["total"], o["attended"], o["pct"],
-        ]))
-    rows_data.sort(key=lambda x: x[0], reverse=True)  # по обяз % убыв.
-    for _, r in rows_data:
-        writer.writerow(r)
-
-    output.seek(0)
-    csv_bytes = output.getvalue().encode("utf-8-sig")
-    file = discord.File(fp=io.BytesIO(csv_bytes), filename=f"attendance_{scope}_{int(time.time())}.csv")
-    embed = discord.Embed(
-        title="📥 Экспорт аттенданса",
-        description=f"Период: **{SCOPE_LABELS.get(scope, scope)}** — **{len(rows_data)}** участников.",
-        color=COLOR_BLUE
-    )
+    err, embed, file = await build_att_export(interaction.guild, scope)
+    if err:
+        await interaction.followup.send(err, ephemeral=True); return
     await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+
+
+@bot.command(name="att-export")
+async def prefix_att_export(ctx: commands.Context, scope: str = "month"):
+    """!att-export [month|week|prev_month|3months|all] — выгрузка лб посещаемости (стафф)."""
+    if ctx.guild is None:
+        return
+    if not (isinstance(ctx.author, discord.Member) and member_is_staff(ctx.author)):
+        await ctx.reply("❌ Только стафф.", mention_author=False); return
+    if scope not in SCOPE_LABELS:
+        await ctx.reply("Период: `week`, `month`, `prev_month`, `3months`, `all`.", mention_author=False); return
+    err, embed, file = await build_att_export(ctx.guild, scope)
+    if err:
+        await ctx.reply(err, mention_author=False); return
+    await ctx.reply(embed=embed, file=file, mention_author=False)
 
 
 # =========================
 # BALANCE COMMANDS
 # =========================
-def fmt_money(n: int) -> str:
-    return f"{n:,}".replace(",", " ") + f" {CURRENCY}"
 
 
 @bot.command(name="bal")
@@ -1934,20 +2480,22 @@ async def money_payout_role(interaction: discord.Interaction, role: discord.Role
 async def money_payout_content(interaction: discord.Interaction, content_id: int, amount: int,
                                reason: Optional[str] = None, force: bool = False):
     await interaction.response.defer(ephemeral=False)
-    row = await db_get_content_by_id(content_id)
+    if interaction.guild_id is None:
+        await interaction.followup.send("Guild недоступен.", ephemeral=True); return
+    row = await db_get_content_by_id(content_id, int(interaction.guild_id))
     if row is None:
         await interaction.followup.send("Контент не найден.", ephemeral=True); return
     member = get_member_safe(interaction)
-    if member is None or not is_organizer_or_admin(member, int(row["created_by"])):
-        await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
+    if member is None or not member_is_staff(member):
+        await interaction.followup.send("Недостаточно прав. Выплата — только стафф.", ephemeral=True); return
     if amount <= 0:
         await interaction.followup.send("Сумма должна быть > 0.", ephemeral=True); return
     user_ids = await db_get_all_participants(content_id)
     if not user_ids:
         await interaction.followup.send("Нет участников.", ephemeral=True); return
     paid, skipped = await db_payout_content_once(
-        int(interaction.guild_id), int(content_id), [int(u) for u in user_ids],
-        amount, int(interaction.user.id), force=force)
+        int(row["guild_id"]), int(content_id), [int(u) for u in user_ids],
+        amount, int(interaction.user.id), force=force, reason=reason)
     embed = discord.Embed(title="✅ Выплата за контент", color=COLOR_GREEN,
         description=f"Контент **#{content_id}**: +{fmt_money(amount)} каждому\n"
                     f"Выплачено: **{paid}** · Пропущено (уже было): **{skipped}**")
@@ -1967,11 +2515,13 @@ async def money_payout_content(interaction: discord.Interaction, content_id: int
 ])
 async def content_copy(interaction: discord.Interaction, content_id: int, mode: str = "full"):
     await interaction.response.defer(ephemeral=True)
-    row = await db_get_content_by_id(content_id)
+    if interaction.guild_id is None:
+        await interaction.followup.send("Guild недоступен.", ephemeral=True); return
+    row = await db_get_content_by_id(content_id, int(interaction.guild_id))
     if row is None:
         await interaction.followup.send("Контент не найден.", ephemeral=True); return
     member = get_member_safe(interaction)
-    if member is None or not member_is_staff(member):
+    if member is None or not is_organizer_or_admin(member, int(row["created_by"])):
         await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
 
     title = str(row["title"])
@@ -2007,11 +2557,11 @@ async def content_copy(interaction: discord.Interaction, content_id: int, mode: 
 async def prefix_copy(ctx: commands.Context, content_id: int, mode: str = "full"):
     """!copy <id> [full|simple] — скопировать кол для вставки."""
     if ctx.guild is None: return
-    if not (isinstance(ctx.author, discord.Member) and member_is_staff(ctx.author)):
-        await ctx.reply("\u274c Только стафф.", mention_author=False); return
-    row = await db_get_content_by_id(content_id)
+    row = await db_get_content_by_id(content_id, ctx.guild.id)
     if row is None:
         await ctx.reply("Контент не найден.", mention_author=False); return
+    if not (isinstance(ctx.author, discord.Member) and is_organizer_or_admin(ctx.author, int(row["created_by"]))):
+        await ctx.reply("❌ Только организатор или стафф.", mention_author=False); return
     roles_lines = normalize_roles_lines(str(row["roles_text"]))
     start_ts = int(row["start_ts"]) if row["start_ts"] else None
     lines = [f"**{row['title']}**"]
@@ -2019,11 +2569,27 @@ async def prefix_copy(ctx: commands.Context, content_id: int, mode: str = "full"
         utc_str = datetime.datetime.fromtimestamp(start_ts, tz=datetime.timezone.utc).strftime("%H:%M UTC")
         lines.append(f"⏰ {utc_str} • {ts_discord(start_ts, 'F')}")
     lines.append("")
-    by_index = {idx: uid for idx, uid in await db_get_roster(content_id)} if mode == "full" else {}
-    for i, rn in enumerate(roles_lines, start=1):
-        uid = by_index.get(i)
-        lines.append(f"`{i}.` {rn} — <@{uid}>" if uid else f"`{i}.` {rn} —")
-    await ctx.reply("\n".join(lines)[:1990], mention_author=False)
+    mode_norm = (mode or "full").lower()
+    if mode_norm not in ("full", "simple"):
+        mode_norm = "full"
+    if mode_norm == "full":
+        by_index = {idx: uid for idx, uid in await db_get_roster(content_id)}
+        for i, rn in enumerate(roles_lines, start=1):
+            uid = by_index.get(i)
+            lines.append(f"`{i}.` {rn} — <@{uid}>" if uid else f"`{i}.` {rn} —")
+    else:
+        for i, rn in enumerate(roles_lines, start=1):
+            lines.append(f"`{i}.` {rn}")
+    text = "\n".join(lines)
+    if len(text) <= 1900:
+        await ctx.reply(text, mention_author=False)
+    else:
+        buf = io.BytesIO(text.encode("utf-8"))
+        await ctx.reply(
+            content=f"Копия контента **#{content_id}**:",
+            file=discord.File(buf, filename=f"content_{content_id}.txt"),
+            mention_author=False,
+        )
 
 
 # =========================
@@ -2127,62 +2693,144 @@ async def prefix_att(ctx: commands.Context, target_member: Optional[discord.Memb
     await ctx.reply(embed=embed, mention_author=False)
 
 
+async def build_economy_stats_embed(guild_id: int) -> discord.Embed:
+    bank, holders = await db_balance_bank(guild_id)
+    lo, hi = window_bounds("all")
+    stats = await db_balance_period_stats(guild_id, lo, hi)
+    embed = discord.Embed(title="🏦 Economy Stats", color=0x1a1f3c)
+    embed.add_field(name="💰 Total Awarded:", value=f"**{fmt_money(stats['awarded'])}**", inline=False)
+    embed.add_field(name="📉 Total Removed:", value=f"**{fmt_money(stats['removed'])}**", inline=False)
+    embed.add_field(name="🏦 Total Bank (к раздаче):", value=f"**{fmt_money(bank)}**", inline=False)
+    embed.add_field(name="👥 Holders:", value=f"**{holders}**", inline=False)
+    return embed
+
+
+async def build_economy_export(
+    guild: discord.Guild, scope: str, user: Optional[discord.Member] = None,
+) -> Tuple[Optional[str], Optional[discord.Embed], List[discord.File]]:
+    """ЛБ балансов + транзакции за период + общая стата. Опционально фильтр по юзеру."""
+    guild_id = guild.id
+    lo, hi = window_bounds(scope)
+    bank, holders = await db_balance_bank(guild_id)
+    lb_rows = await db_balance_leaderboard(guild_id)
+    guild_stats = await db_balance_period_stats(guild_id, lo, hi)
+    events = await db_balance_events_range(guild_id, lo, hi, None if user is None else int(user.id))
+
+    if not lb_rows and not events and guild_stats["count"] == 0:
+        return "Нет данных для экспорта.", None, []
+
+    def name_of(uid: int) -> str:
+        gm = guild.get_member(uid)
+        return gm.display_name if gm else f"ID:{uid}"
+
+    embed = discord.Embed(title="📥 Выгрузка экономики", color=COLOR_BLUE)
+    embed.add_field(name="Период", value=SCOPE_LABELS.get(scope, scope), inline=True)
+    if user is not None:
+        embed.add_field(name="Фильтр транзакций", value=user.mention, inline=True)
+    embed.add_field(
+        name="💰 Сейчас (к раздаче)",
+        value=f"Общий баланс: **{fmt_money(bank)}**\nДержателей: **{holders}**",
+        inline=False,
+    )
+    embed.add_field(
+        name="📊 Движение за период (вся гильдия)",
+        value=(
+            f"Начислено (+): **{fmt_money(guild_stats['awarded'])}**\n"
+            f"Списано (−): **{fmt_money(guild_stats['removed'])}**\n"
+            f"Сальдо: **{fmt_money(guild_stats['net'])}**\n"
+            f"Транзакций: **{guild_stats['count']}**"
+        ),
+        inline=False,
+    )
+    if user is not None:
+        user_stats = await db_balance_period_stats(guild_id, lo, hi, int(user.id))
+        user_bal = await db_balance_get(guild_id, int(user.id))
+        if scope == "all":
+            match = user_stats["net"] == user_bal
+            recon = (
+                f"\nΣ всех delta: **{fmt_money(user_stats['net'])}**"
+                f"\nСверка с балансом: {'✅ сходится' if match else '⚠️ не сходится'}"
+            )
+        else:
+            recon = "\nДля полной сверки баланса выбери период «Всё время»."
+        embed.add_field(
+            name=f"👤 {user.display_name}",
+            value=(
+                f"Текущий баланс: **{fmt_money(user_bal)}**\n"
+                f"Начислено (+): **{fmt_money(user_stats['awarded'])}**\n"
+                f"Списано (−): **{fmt_money(user_stats['removed'])}**\n"
+                f"Сальдо периода: **{fmt_money(user_stats['net'])}**\n"
+                f"Транзакций: **{user_stats['count']}**"
+                f"{recon}"
+            ),
+            inline=False,
+        )
+
+    lb_csv_rows = []
+    for i, (uid, amount) in enumerate(lb_rows, start=1):
+        gm = guild.get_member(uid)
+        lb_csv_rows.append([
+            i, uid,
+            gm.name if gm else "Неизвестно",
+            gm.display_name if gm else f"ID:{uid}",
+            amount,
+        ])
+    ts = int(time.time())
+    files = [
+        make_csv_file(
+            f"economy_lb_{ts}.csv",
+            ["Место", "User ID", "Никнейм", "Отображаемое имя", "Баланс"],
+            lb_csv_rows,
+        )
+    ]
+    tx_rows = [[
+        datetime.datetime.fromtimestamp(e["created_at"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        e["user_id"], name_of(e["user_id"]),
+        e["delta"], e["balance_after"],
+        e["kind"], e["reason"],
+        e["actor_id"], name_of(e["actor_id"]),
+    ] for e in events]
+    who = f"_{user.id}" if user is not None else ""
+    files.append(make_csv_file(
+        f"economy_tx_{scope}{who}_{ts}.csv",
+        ["Дата (UTC)", "User ID", "Пользователь", "Дельта (+/−)", "Баланс после",
+         "Тип", "Причина", "Кто начислил ID", "Кто начислил"],
+        tx_rows,
+    ))
+    return None, embed, files
+
+
 @bot.command(name="economy-stats")
 async def prefix_economy_stats(ctx: commands.Context):
     """!economy-stats — общая статистика экономики гильдии (стафф)."""
-    if ctx.guild is None: return
+    if ctx.guild is None:
+        return
     if not (isinstance(ctx.author, discord.Member) and member_is_staff(ctx.author)):
-        await ctx.reply("\u274c Только стафф.", mention_author=False); return
+        await ctx.reply("❌ Только стафф.", mention_author=False); return
+    await ctx.reply(embed=await build_economy_stats_embed(ctx.guild.id), mention_author=False)
 
-    # Текущие балансы на руках (сумма всего, что сейчас у участников)
-    cur = await DB.execute(
-        "SELECT COALESCE(SUM(amount), 0) FROM balances WHERE guild_id = ?",
-        (ctx.guild.id,)
-    )
-    total_bank = int((await cur.fetchone())[0])
 
-    # Всего начислено за всё время (сумма всех положительных delta)
-    cur = await DB.execute(
-        "SELECT COALESCE(SUM(delta), 0) FROM balance_events WHERE guild_id = ? AND delta > 0",
-        (ctx.guild.id,)
-    )
-    total_awarded = int((await cur.fetchone())[0])
+@bot.tree.command(name="economy_stats", description="Общая статистика экономики (стафф)")
+async def economy_stats(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    member = get_member_safe(interaction)
+    if member is None or not member_is_staff(member):
+        await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
+    if interaction.guild_id is None:
+        await interaction.followup.send("Guild недоступен.", ephemeral=True); return
+    await interaction.followup.send(embed=await build_economy_stats_embed(int(interaction.guild_id)), ephemeral=True)
 
-    # Всего участников с ненулевым балансом
-    cur = await DB.execute(
-        "SELECT COUNT(*) FROM balances WHERE guild_id = ? AND amount > 0",
-        (ctx.guild.id,)
-    )
-    holders = int((await cur.fetchone())[0])
-
-    embed = discord.Embed(
-        title="\U0001f3e6  Economy Stats",
-        color=0x1a1f3c
-    )
-    embed.add_field(
-        name="\U0001f4b0 Total Awarded:",
-        value=f"**{fmt_money(total_awarded)}**",
-        inline=False
-    )
-    embed.add_field(
-        name="\U0001f3e6 Total Bank:",
-        value=f"**{fmt_money(total_bank)}**",
-        inline=False
-    )
-    embed.add_field(
-        name="\U0001f465 Holders:",
-        value=f"**{holders}**",
-        inline=False
-    )
-    await ctx.reply(embed=embed, mention_author=False)
 
 @bot.command(name="economy-lb")
 async def prefix_economy_lb(ctx: commands.Context):
     """!economy-lb — лидерборд по балансам (для всех)."""
-    if ctx.guild is None: return
+    if ctx.guild is None:
+        return
     rows = await db_balance_leaderboard(ctx.guild.id)
     my_bal = await db_balance_get(ctx.guild.id, ctx.author.id)
-    view = LeaderboardView(rows=rows, guild=ctx.guild, requester_id=ctx.author.id, my_count=my_bal, money=True)
+    bank, _holders = await db_balance_bank(ctx.guild.id)
+    view = LeaderboardView(rows=rows, guild=ctx.guild, requester_id=ctx.author.id,
+                           my_count=my_bal, money=True, total_sum=bank)
     await ctx.reply(embed=view.build_embed(), view=view, mention_author=False)
 
 
@@ -2191,54 +2839,224 @@ async def economy_lb(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
     if interaction.guild is None or interaction.guild_id is None:
         await interaction.followup.send("Guild недоступен."); return
-    rows = await db_balance_leaderboard(int(interaction.guild_id))
-    my_bal = await db_balance_get(int(interaction.guild_id), int(interaction.user.id))
-    view = LeaderboardView(rows=rows, guild=interaction.guild, requester_id=interaction.user.id, my_count=my_bal, money=True)
+    gid = int(interaction.guild_id)
+    rows = await db_balance_leaderboard(gid)
+    my_bal = await db_balance_get(gid, int(interaction.user.id))
+    bank, _holders = await db_balance_bank(gid)
+    view = LeaderboardView(rows=rows, guild=interaction.guild, requester_id=interaction.user.id,
+                           my_count=my_bal, money=True, total_sum=bank)
     await interaction.followup.send(embed=view.build_embed(), view=view)
 
 
-@bot.tree.command(name="economy_export_csv", description="Выгрузить транзакции экономики в CSV (стафф)")
-@app_commands.describe(days="За сколько последних дней (по умолчанию 30)")
-async def economy_export_csv(interaction: discord.Interaction, days: int = 30):
+@bot.tree.command(name="economy_export_csv", description="Выгрузить лб и транзакции экономики (стафф)")
+@app_commands.describe(
+    scope="Период транзакций (по умолчанию текущий месяц)",
+    user="Только транзакции этого пользователя (для сверки +/-)",
+)
+@app_commands.choices(scope=SCOPE_CHOICES)
+async def economy_export_csv(
+    interaction: discord.Interaction,
+    scope: str = "month",
+    user: Optional[discord.Member] = None,
+):
     await interaction.response.defer(ephemeral=True)
     if interaction.guild is None or interaction.guild_id is None:
         await interaction.followup.send("Guild недоступен.", ephemeral=True); return
     member = interaction.guild.get_member(interaction.user.id)
     if member is None or not member_is_staff(member):
         await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
-    if days <= 0:
-        days = 30
-    since = int(time.time()) - days * 86400
-    events = await db_balance_events_since(int(interaction.guild_id), since)
-    if not events:
-        await interaction.followup.send(f"Нет транзакций за последние {days} дн.", ephemeral=True); return
+    err, embed, files = await build_economy_export(interaction.guild, scope, user)
+    if err:
+        await interaction.followup.send(err, ephemeral=True); return
+    await interaction.followup.send(embed=embed, files=files, ephemeral=True)
 
-    def name_of(uid: int) -> str:
-        gm = interaction.guild.get_member(uid)
-        return gm.display_name if gm else f"ID:{uid}"
 
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Дата (UTC)", "User ID", "Пользователь", "Дельта", "Баланс после",
-                     "Тип", "Причина", "Кто начислил ID", "Кто начислил"])
-    for e in events:
-        writer.writerow([
-            datetime.datetime.fromtimestamp(e["created_at"], tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-            e["user_id"], name_of(e["user_id"]), e["delta"], e["balance_after"],
-            e["kind"], e["reason"], e["actor_id"], name_of(e["actor_id"]),
-        ])
-    output.seek(0)
-    csv_bytes = output.getvalue().encode("utf-8-sig")
-    file = discord.File(fp=io.BytesIO(csv_bytes), filename=f"economy_{days}d_{int(time.time())}.csv")
-    embed = discord.Embed(title="📥 Выгрузка экономики",
-                          description=f"Транзакций за последние **{days}** дн.: **{len(events)}**",
-                          color=COLOR_BLUE)
-    await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+@bot.command(name="economy-export")
+async def prefix_economy_export(ctx: commands.Context, member: Optional[discord.Member] = None):
+    """!economy-export [@user] — выгрузка лб + транзакции за текущий месяц (стафф)."""
+    if ctx.guild is None:
+        return
+    if not (isinstance(ctx.author, discord.Member) and member_is_staff(ctx.author)):
+        await ctx.reply("❌ Только стафф.", mention_author=False); return
+    err, embed, files = await build_economy_export(ctx.guild, "month", member)
+    if err:
+        await ctx.reply(err, mention_author=False); return
+    await ctx.reply(embed=embed, files=files, mention_author=False)
+
+
+# =========================
+# SIPHONED ENERGY COMMANDS
+# =========================
+def _fmt_energy(n: int) -> str:
+    sign = "+" if n > 0 else ""
+    return f"{sign}{n:,}".replace(",", " ")
+
+
+def build_siphon_player_embed(data: dict) -> discord.Embed:
+    net = data["net"]
+    color = COLOR_RED if net < 0 else (COLOR_GREEN if net > 0 else COLOR_GOLD)
+    status = "должен гильдии" if net < 0 else ("в плюсе" if net > 0 else "ноль")
+    embed = discord.Embed(
+        title=f"⚡ Энергия · {data['player']}",
+        description=f"Статус: **{status}**\nТекущий баланс: **{_fmt_energy(net)}**",
+        color=color,
+    )
+    embed.add_field(name="Сдал", value=_fmt_energy(data["deposited"]), inline=True)
+    embed.add_field(name="Снял", value=_fmt_energy(-data["withdrawn"] if data["withdrawn"] else 0), inline=True)
+    embed.add_field(name="Операций", value=str(data["ops"]), inline=True)
+    if data["events"]:
+        lines = []
+        for e in data["events"][:15]:
+            mark = "📥" if e["reason"] == "Deposit" else "📤"
+            lines.append(f"`{e['at']}` {mark} {_fmt_energy(e['amount'])}")
+        embed.add_field(name="Последние операции", value="\n".join(lines), inline=False)
+    return embed
+
+
+async def _import_siphon_bytes(guild_id: int, actor_id: int, raw: bytes) -> Tuple[Optional[discord.Embed], Optional[str]]:
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("cp1251")
+        except UnicodeDecodeError:
+            return None, "Не удалось прочитать файл (нужен UTF-8 или Windows-1251)."
+    parsed, errors = parse_siphon_txt(text)
+    if not parsed and not errors:
+        return None, "В файле нет строк."
+    inserted, skipped = await db_siphon_import(guild_id, parsed, actor_id) if parsed else (0, 0)
+    embed = discord.Embed(title="⚡ Импорт энергии", color=COLOR_GREEN if inserted or skipped else COLOR_YELLOW)
+    embed.add_field(name="Распознано", value=str(len(parsed)), inline=True)
+    embed.add_field(name="Новых", value=str(inserted), inline=True)
+    embed.add_field(name="Уже были", value=str(skipped), inline=True)
+    if errors:
+        embed.add_field(name=f"Ошибки ({len(errors)})", value="\n".join(errors[:8]), inline=False)
+    return embed, None
+
+
+@bot.tree.command(name="energy_import", description="Залить txt лог Siphoned Energy (стафф)")
+@app_commands.describe(file="TXT из игры: Date / Player / Reason / Amount")
+async def energy_import(interaction: discord.Interaction, file: discord.Attachment):
+    await interaction.response.defer(ephemeral=True)
+    member = get_member_safe(interaction)
+    if member is None or not member_is_staff(member):
+        await interaction.followup.send("Недостаточно прав.", ephemeral=True); return
+    if interaction.guild_id is None:
+        await interaction.followup.send("Guild недоступен.", ephemeral=True); return
+    name = (file.filename or "").lower()
+    if not (name.endswith(".txt") or name.endswith(".tsv") or name.endswith(".csv")):
+        await interaction.followup.send("Нужен файл `.txt` (копия лога из игры).", ephemeral=True); return
+    if file.size and file.size > 2_000_000:
+        await interaction.followup.send("Файл слишком большой (лимит 2 МБ).", ephemeral=True); return
+    raw = await file.read()
+    embed, err = await _import_siphon_bytes(int(interaction.guild_id), int(interaction.user.id), raw)
+    if err:
+        await interaction.followup.send(err, ephemeral=True); return
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.command(name="energy-import")
+async def prefix_energy_import(ctx: commands.Context):
+    """!energy-import + вложение .txt — залить лог энергии (стафф)."""
+    if ctx.guild is None:
+        return
+    if not (isinstance(ctx.author, discord.Member) and member_is_staff(ctx.author)):
+        await ctx.reply("❌ Только стафф.", mention_author=False); return
+    atts = [a for a in ctx.message.attachments
+            if (a.filename or "").lower().endswith((".txt", ".tsv", ".csv"))]
+    if not atts:
+        await ctx.reply("Прикрепи `.txt` лог к сообщению: `!energy-import`", mention_author=False); return
+    raw = await atts[0].read()
+    embed, err = await _import_siphon_bytes(ctx.guild.id, ctx.author.id, raw)
+    if err:
+        await ctx.reply(err, mention_author=False); return
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.tree.command(name="energy", description="Статус энергии игрока по нику Albion")
+@app_commands.describe(nick="Ник в Albion")
+async def energy_status(interaction: discord.Interaction, nick: str):
+    await interaction.response.defer(ephemeral=False)
+    if interaction.guild_id is None:
+        await interaction.followup.send("Guild недоступен."); return
+    data = await db_siphon_player(int(interaction.guild_id), nick)
+    if data is None:
+        hints = await db_siphon_suggest(int(interaction.guild_id), nick)
+        extra = (" Похожие: " + ", ".join(f"`{h}`" for h in hints)) if hints else ""
+        await interaction.followup.send(f"Игрок `{nick}` не найден.{extra}"); return
+    await interaction.followup.send(embed=build_siphon_player_embed(data))
+
+
+@bot.command(name="energy")
+async def prefix_energy(ctx: commands.Context, *, nick: Optional[str] = None):
+    """!energy <ник> — статус энергии."""
+    if ctx.guild is None:
+        return
+    if not nick or not nick.strip():
+        await ctx.reply("Формат: `!energy НикВИгре`", mention_author=False); return
+    data = await db_siphon_player(ctx.guild.id, nick.strip())
+    if data is None:
+        hints = await db_siphon_suggest(ctx.guild.id, nick.strip())
+        extra = (" Похожие: " + ", ".join(f"`{h}`" for h in hints)) if hints else ""
+        await ctx.reply(f"Игрок `{nick.strip()}` не найден.{extra}", mention_author=False); return
+    await ctx.reply(embed=build_siphon_player_embed(data), mention_author=False)
+
+
+def build_siphon_lb_embed(rows: List[dict], summary: dict) -> discord.Embed:
+    head = []
+    if summary.get("import_first") and summary.get("import_last"):
+        a, b = summary["import_first"], summary["import_last"]
+        if a == b:
+            head.append(f"Импорт: {ts_discord(a, 'f')}")
+        else:
+            head.append(f"Импорт: {ts_discord(a, 'f')} → {ts_discord(b, 'f')}")
+    head.append(f"Всего: **{_fmt_energy(summary['net'])}**")
+    embed = discord.Embed(
+        title="⚡ Энергия",
+        description="\n".join(head),
+        color=COLOR_GOLD,
+    )
+    lines = [
+        f"**{i}.** {r['player']} · **{_fmt_energy(r['net'])}**"
+        for i, r in enumerate(rows, start=1)
+    ]
+    add_chunked_field(embed, "Баланс", lines)
+    embed.set_footer(text=f"{summary['players']} игроков")
+    return embed
+
+
+@bot.tree.command(name="energy_lb", description="Лидерборд энергии за всё время")
+async def energy_lb(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    if interaction.guild_id is None:
+        await interaction.followup.send("Guild недоступен."); return
+    gid = int(interaction.guild_id)
+    summary = await db_siphon_summary(gid)
+    if summary is None:
+        await interaction.followup.send("Пока нет импортов энергии."); return
+    rows = await db_siphon_leaderboard(gid)
+    await interaction.followup.send(embed=build_siphon_lb_embed(rows, summary))
+
+
+@bot.command(name="energy-lb")
+async def prefix_energy_lb(ctx: commands.Context):
+    """!energy-lb — лидерборд энергии за всё время."""
+    if ctx.guild is None:
+        return
+    summary = await db_siphon_summary(ctx.guild.id)
+    if summary is None:
+        await ctx.reply("Пока нет импортов энергии.", mention_author=False); return
+    rows = await db_siphon_leaderboard(ctx.guild.id)
+    await ctx.reply(embed=build_siphon_lb_embed(rows, summary), mention_author=False)
 
 # =========================
 # MAIN
 # =========================
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_TOKEN не найден. Проверьте .env")
